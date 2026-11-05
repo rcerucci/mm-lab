@@ -413,18 +413,18 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     arms.add_column("Arm", style="bold", no_wrap=True, min_width=8)
     arms.add_column("Mode", no_wrap=True)
     arms.add_column("Spr", justify="right")
-    arms.add_column("Equity", justify="right")
+    arms.add_column("Eq", justify="right", no_wrap=True, min_width=7)
     arms.add_column("Ret%", justify="right", no_wrap=True, min_width=6)
-    arms.add_column("Cap", justify="right")
-    arms.add_column("Inv%", justify="right")
-    arms.add_column("F/O/T", justify="right", no_wrap=True, min_width=9)
+    arms.add_column("Cap", justify="right", no_wrap=True, min_width=4)
+    arms.add_column("Inv%", justify="right", no_wrap=True, min_width=3)
+    arms.add_column("F/O/T", justify="right", no_wrap=True, min_width=11)
     arms.add_column("Além", justify="right", no_wrap=True, min_width=7)
-    arms.add_column("Paus", justify="right", no_wrap=True)
-    arms.add_column("AS5s", justify="right")
-    arms.add_column("AS1m", justify="right")
-    arms.add_column("Fund", justify="right")
-    arms.add_column("Recal", justify="right")
-    arms.add_column("Spark", no_wrap=True)
+    arms.add_column("Paus", justify="right", no_wrap=True, min_width=3)
+    arms.add_column("AS5s", justify="right", no_wrap=True, min_width=4)
+    arms.add_column("AS1m", justify="right", no_wrap=True, min_width=4)
+    arms.add_column("Fund", justify="right", no_wrap=True, min_width=6)
+    arms.add_column("Recal", justify="right", no_wrap=True, min_width=4)
+    arms.add_column("Spark", no_wrap=True, min_width=8)
 
     def _arm_sort(k: str):
         b = books[k]
@@ -455,7 +455,8 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
         if nxt is None:
             recal = "fix" if (b.get("recal_key") == "A" or b.get("neighbor")) else "—"
         else:
-            recal = f"{nxt/3600:.1f}h"
+            hours = nxt / 3600.0
+            recal = f"{hours:.0f}h" if hours >= 10 else f"{hours:.1f}h"
         nf = int(b.get("n_fills") or 0)
         no = int(b.get("n_fills_opt") or 0)
         nt_raw = b.get("n_fills_through")
@@ -468,8 +469,8 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
         pauses = _sum_dict_or_int(b.get("n_pauses"))
         paus_s = str(pauses) if ("n_pauses" in b) else "—"
         fund = b.get("funding_pnl")
-        fund_s = f"${fund:+.3f}" if fund is not None else "—"
-        spark = _spark(pnl_hist.get(key, []), 12)
+        fund_s = f"{fund:+.3f}" if fund is not None else "—"
+        spark = _spark(pnl_hist.get(key, []), 8)
         name_style = "dim" if b.get("neighbor") else ("bold yellow" if is_best else "bold")
         arm_label = f"{key}★" if is_best else key
         arms.add_row(
@@ -610,17 +611,17 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
         Layout(
             Panel(
                 arms,
-                title="[bold]Braços $100 1x[/] FIX=cap$100 · CMP=cap=equity · ★=melhor Ret%",
+                title="[bold]Braços[/] $100 1x · ★=melhor",
                 border_style="blue",
                 padding=(0, 0),
             ),
             name="arms",
-            ratio=3,
+            ratio=5,
         ),
         Layout(
             Panel(
                 makers_t,
-                title="[bold]Makers[/] ★=promissor (recal) · ·=viable PnL=?",
+                title="[bold]Makers[/] ★=promissor · ·=viable",
                 border_style="green",
                 padding=(0, 0),
             ),
