@@ -33,11 +33,11 @@ VIABLE_MAX_PAUSE_FRAC = 0.7
 
 # Promissor = viable + profitable (or activity proxy when PnL unknown).
 # Used for B/C/D recalibration medians. Known losers (est_pnl <= 0) excluded.
-PROMISSOR_MIN_SNAPS = 20          # quote snapshots in tracker lifetime
-PROMISSOR_MIN_FILLS_PROXY = 5     # Lighter/unknown-PnL: min maker fills
-PROMISSOR_MIN_SNAPS_ONLY = 20     # alternate proxy: enough snaps even if fills=0 (WS miss)
-PROMISSOR_MIN_CYCLE_SAMPLES = 5   # enough cycle observations = "stable"
-# Lighter has no reliable closedPnl; fills + snaps are the proxy (documented in PRE_REGISTRO).
+PROMISSOR_MIN_SNAPS = 80          # ~2 min at 1.5 s Lighter poll
+PROMISSOR_MIN_PRESENCE_S = 300.0  # 5 min on book before activity proxy
+PROMISSOR_MIN_FILLS_PROXY = 5     # kept for display; no longer an OR bypass
+PROMISSOR_MIN_CYCLE_SAMPLES = 5   # real cycle observations (not seeded)
+# Lighter has no reliable closedPnl; presence + stable cycle is the proxy.
 
 # Simulator — faithful to a real US$100 1x account
 INITIAL_EQUITY = 100.0
@@ -64,9 +64,13 @@ ROLLING_WINDOW_S = 14 * 86400
 MAX_SPREAD_STEP = 0.0005
 MAX_REFRESH_STEP_S = 10.0
 MIN_SPREAD = 0.0005
+RECAL_MIN_SPREAD = 0.0010  # 10 bps floor for B/C/D; A5 stays a fixed neighbor
 MAX_SPREAD = 0.0050
 MIN_REFRESH_S = 5.0
 MAX_REFRESH_S = 120.0
+HL_CYCLE_CENSOR_MULT = 2.0  # HL cycle must exceed 2x observe gap
+AS_TOLERANCE_S = {"1s": 1.0, "5s": 2.0, "30s": 5.0, "1m": 15.0, "5m": 30.0}
+VERSION_PATH = ROOT / "VERSION"
 
 # Observer cadence
 LIGHTER_ORDERS_POLL_S = 1.5

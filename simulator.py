@@ -31,6 +31,7 @@ from config import (
     MID_JUMP_TRIGGER,
     MIN_REFRESH_S,
     MIN_SPREAD,
+    RECAL_MIN_SPREAD,
     ORDER_USD_BASE,
     PNL_HIST_PATH,
     ROLLING_WINDOW_S,
@@ -38,6 +39,8 @@ from config import (
     SKEW_CAP_FRAC,
     SKEW_PER_USD,
     SPREAD_NEIGHBORS,
+    AS_TOLERANCE_S,
+    VERSION_PATH,
 )
 from storage import Store, append_jsonl
 
@@ -45,6 +48,15 @@ from storage import Store, append_jsonl
 def _log(msg: str) -> None:
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts} America/Sao_Paulo] {msg}", flush=True)
+
+
+def read_git_rev() -> str:
+    try:
+        if VERSION_PATH.exists():
+            return VERSION_PATH.read_text().strip().split()[0][:40]
+    except Exception:
+        pass
+    return "unknown"
 
 
 @dataclass
@@ -59,6 +71,7 @@ class Quote:
     ask_queue_ahead: float = 0.0
     bid_sz_opt: float = 0.0
     ask_sz_opt: float = 0.0
+    retire_at: Optional[float] = None
 
 
 @dataclass
@@ -86,6 +99,9 @@ class ArmBook:
     usdc: float = INITIAL_EQUITY
     inv: Dict[str, float] = field(default_factory=lambda: {c: 0.0 for c in HL_COINS})
     quotes: Dict[str, Optional[Quote]] = field(
+        default_factory=lambda: {c: None for c in HL_COINS}
+    )
+    stale: Dict[str, Optional[Quote]] = field(
         default_factory=lambda: {c: None for c in HL_COINS}
     )
     fees_paid: float = 0.0
@@ -134,11 +150,21 @@ class ArmBook:
         return (self.equity(mids) / INITIAL_EQUITY - 1.0) * 100.0
 
     def inv_usd(self, mids: Dict[str, float]) -> float:
+        """Signed net inventory in USD (display / skew)."""
         total = 0.0
         for c, q in self.inv.items():
             m = mids.get(c)
             if m is not None:
                 total += q * m
+        return total
+
+    def inv_usd_gross(self, mids: Dict[str, float]) -> float:
+        """Sum of |qty * mid| across coins — the 1x usage of the account."""
+        total = 0.0
+        for c, q in self.inv.items():
+            m = mids.get(c)
+            if m is not None:
+                total += abs(q * m)
         return total
 
     def cap(self, mids: Dict[str, float]) -> float:
@@ -301,15 +327,21 @@ class Simulator:
                     for tag in ("1s", "5s", "30s"):
                         setattr(b, f"as_{tag}_sum", 0.0)
                         setattr(b, f"as_{tag}_ntl", 0.0)
+                def _load_quote(qraw):
+                    if not qraw:
+                        return None
+                    defaults = {
+                        "bid_queue_ahead": 0.0, "ask_queue_ahead": 0.0,
+                        "bid_sz_opt": qraw.get("bid_sz", 0),
+                        "ask_sz_opt": qraw.get("ask_sz", 0),
+                        "retire_at": None,
+                    }
+                    defaults.update(qraw)
+                    return Quote(**{k: defaults[k] for k in Quote.__dataclass_fields__})
                 for c, qraw in (braw.get("quotes") or {}).items():
-                    if qraw:
-                        defaults = {
-                            "bid_queue_ahead": 0.0, "ask_queue_ahead": 0.0,
-                            "bid_sz_opt": qraw.get("bid_sz", 0),
-                            "ask_sz_opt": qraw.get("ask_sz", 0),
-                        }
-                        defaults.update(qraw)
-                        b.quotes[c] = Quote(**{k: defaults[k] for k in Quote.__dataclass_fields__})
+                    b.quotes[c] = _load_quote(qraw)
+                for c, qraw in (braw.get("stale") or {}).items():
+                    b.stale[c] = _load_quote(qraw)
         except Exception as e:  # noqa: BLE001
             bak = self._backup_state()
             _log(f"sim state LOAD FAILED: {type(e).__name__}: {e}; starting fresh; backup={bak}")
@@ -342,11 +374,13 @@ class Simulator:
             "funding_rate": self.funding_rate,
             "last_funding_apply": self.last_funding_apply,
             "latency_api_s": LATENCY_API_S,
+            "git_rev": read_git_rev(),
             "books": {},
         }
         for key, b in self.books.items():
             cap = b.cap(self.mids) if self.mids else INITIAL_EQUITY
             inv_u = b.inv_usd(self.mids) if self.mids else 0.0
+            inv_g = b.inv_usd_gross(self.mids) if self.mids else 0.0
             eq = b.equity(self.mids) if self.mids else b.usdc
             payload["books"][key] = {
                 "arm": b.arm, "recal_key": b.recal_key, "mode": b.mode,
@@ -367,13 +401,15 @@ class Simulator:
                 "paused": b.paused,
                 "pending_as": [asdict(p) for p in b.pending_as],
                 "quotes": {c: (None if q is None else asdict(q)) for c, q in b.quotes.items()},
+                "stale": {c: (None if q is None else asdict(q)) for c, q in b.stale.items()},
                 "equity": eq,
                 "pnl_net": eq - INITIAL_EQUITY,
                 "pnl_net_2x": (eq - INITIAL_EQUITY) - (b.fees_paid_2x - b.fees_paid),
                 "ret_pct": (eq / INITIAL_EQUITY - 1.0) * 100.0,
                 "cap": cap,
                 "inv_usd": inv_u,
-                "inv_cap_pct": (abs(inv_u) / cap * 100.0) if cap > 0 else 0.0,
+                "inv_gross": inv_g,
+                "inv_cap_pct": (inv_g / cap * 100.0) if cap > 0 else 0.0,
                 "order_usd": b.order_usd(self.mids) if self.mids else ORDER_USD_BASE,
                 "next_recal_s": self._next_recal_s(b),
             }
@@ -433,27 +469,66 @@ class Simulator:
         for b in self.books.values():
             self._try_fill(b, coin, px, sz, side, now)
 
+    def _retire_quote(self, book: ArmBook, coin: str, now: float) -> None:
+        q = book.quotes.get(coin)
+        if q is not None and q.retire_at is None:
+            q.retire_at = now + LATENCY_API_S
+        stale = book.stale.get(coin)
+        if stale is not None and stale.retire_at is None:
+            stale.retire_at = now + LATENCY_API_S
+
+    def _sweep_expired(self, book: ArmBook, coin: str, now: float) -> None:
+        q = book.quotes.get(coin)
+        if q is not None and q.retire_at is not None and now >= q.retire_at:
+            book.quotes[coin] = None
+        stale = book.stale.get(coin)
+        if stale is not None and stale.retire_at is not None and now >= stale.retire_at:
+            book.stale[coin] = None
+
+    def _fillable_quotes(self, book: ArmBook, coin: str, now: float):
+        self._sweep_expired(book, coin, now)
+        out = []
+        for q in (book.stale.get(coin), book.quotes.get(coin)):
+            if q is None:
+                continue
+            if now < q.effective_at:
+                continue
+            if q.retire_at is not None and now >= q.retire_at:
+                continue
+            out.append(q)
+        return out
+
     def _place(self, book: ArmBook, coin: str, now: float) -> None:
         mid = self.mids.get(coin)
         bbo = self.bbo.get(coin)
         if mid is None or mid <= 0 or bbo is None or book.paused:
             return
         cap = book.cap(self.mids)
-        inv_u = book.inv_usd(self.mids)
-        # side policy at inventory cap
+        gross = book.inv_usd_gross(self.mids)
+        inv_coin = book.inv[coin] * mid
+        # side policy at gross inventory cap: a loaded coin may only reduce;
+        # a flat coin at the cap quotes nothing new.
         allow_bid = True
         allow_ask = True
-        if inv_u >= INV_CAP_SOFT * cap:
-            allow_bid = False  # only reduce (sell)
-        elif inv_u <= -INV_CAP_SOFT * cap:
-            allow_ask = False  # only reduce (buy)
+        if gross >= INV_CAP_SOFT * cap:
+            if inv_coin > 1e-12:
+                allow_bid = False
+            elif inv_coin < -1e-12:
+                allow_ask = False
+            else:
+                allow_bid = False
+                allow_ask = False
 
         order_usd = book.order_usd(self.mids)
-        # don't bid more than remaining room to cap
-        room_long = max(0.0, cap - inv_u)
-        room_short = max(0.0, cap + inv_u)
-        bid_usd = min(order_usd, room_long) if allow_bid else 0.0
-        ask_usd = min(order_usd, room_short) if allow_ask else 0.0
+        room = max(0.0, cap - gross)
+        if allow_bid:
+            bid_usd = order_usd if book.inv[coin] < 0 else min(order_usd, room)
+        else:
+            bid_usd = 0.0
+        if allow_ask:
+            ask_usd = order_usd if book.inv[coin] > 0 else min(order_usd, room)
+        else:
+            ask_usd = 0.0
         if bid_usd > 0 and bid_usd < HL_MIN_ORDER_USD:
             bid_usd = 0.0  # cannot place below HL min
         if ask_usd > 0 and ask_usd < HL_MIN_ORDER_USD:
@@ -477,6 +552,11 @@ class Simulator:
 
         bid_sz = (bid_usd / mid) if bid_usd > 0 else 0.0
         ask_sz = (ask_usd / mid) if ask_usd > 0 else 0.0
+        old = book.quotes.get(coin)
+        if old is not None:
+            if old.retire_at is None:
+                old.retire_at = now + LATENCY_API_S
+            book.stale[coin] = old
         if bid_sz <= 0 and ask_sz <= 0:
             book.quotes[coin] = None
             book.last_refresh[coin] = now
@@ -491,6 +571,7 @@ class Simulator:
             bid_queue_ahead=b_better + b_same,
             ask_queue_ahead=a_better + a_same,
             bid_sz_opt=bid_sz, ask_sz_opt=ask_sz,
+            retire_at=None,
         )
         book.last_refresh[coin] = now
 
@@ -508,25 +589,40 @@ class Simulator:
                     if abs(mid - qmid) / mid > MID_JUMP_TRIGGER * book.spread:
                         need = True
                         if abs(mid - qmid) / mid > 3 * book.spread:
-                            book.paused = True
+                            if not book.paused:
+                                book.paused = True
+                                self._retire_quote(book, coin, now)
+                            else:
+                                book.paused = True
                 if book.paused and (now - last) > max(5.0, book.refresh_s):
                     book.paused = False
                     need = True
-                # also refresh when inv crosses soft cap
+                # also refresh when gross inv crosses soft cap
                 if self.mids:
                     cap = book.cap(self.mids)
-                    inv_u = book.inv_usd(self.mids)
-                    if abs(inv_u) >= INV_CAP_SOFT * cap:
+                    gross = book.inv_usd_gross(self.mids)
+                    if gross >= INV_CAP_SOFT * cap:
                         need = True
                 if need and not book.paused:
                     self._place(book, coin, now)
+                elif book.paused:
+                    self._retire_quote(book, coin, now)
 
     def _try_fill(self, book, coin, px, sz, side, now) -> None:
-        q = book.quotes.get(coin)
-        if q is None or book.paused:
+        qs = self._fillable_quotes(book, coin, now)
+        if not qs:
             return
-        if now < q.effective_at:
-            return
+        for q in qs:
+            self._try_fill_one(book, coin, px, sz, side, now, q)
+        cur = book.quotes.get(coin)
+        if (
+            cur is not None
+            and cur.bid_sz <= 0 and cur.ask_sz <= 0
+            and not book.paused
+        ):
+            self._place(book, coin, now)
+
+    def _try_fill_one(self, book, coin, px, sz, side, now, q) -> None:
         # optimistic
         if side == "A" and q.bid_sz_opt > 0 and px <= q.bid_px + 1e-12:
             take = min(q.bid_sz_opt, sz)
@@ -571,15 +667,17 @@ class Simulator:
         elif side == "B" and q.ask_sz > 0 and px < q.ask_px:
             if q.ask_queue_ahead > 0:
                 q.ask_queue_ahead = max(0.0, q.ask_queue_ahead - sz)
-        if q is not None and q.bid_sz <= 0 and q.ask_sz <= 0:
-            self._place(book, coin, now)
-
     def _would_respect_cap(self, book, coin, side, sz, px) -> bool:
-        # projected inv usd after fill
-        inv_u = book.inv_usd(self.mids)
-        delta = sz * px if side == "buy" else -sz * px
+        notionals = {}
+        for c, q in book.inv.items():
+            m = self.mids.get(c)
+            if m is not None:
+                notionals[c] = q * m
+        delta_qty = sz if side == "buy" else -sz
+        notionals[coin] = (book.inv.get(coin, 0.0) + delta_qty) * px
+        projected = sum(abs(v) for v in notionals.values())
         cap = book.cap(self.mids)
-        return abs(inv_u + delta) <= cap * 1.001  # tiny epsilon
+        return projected <= cap * 1.001  # tiny epsilon
 
     def _apply_fill(self, book, coin, our_side, px, sz, now, queue: bool = True) -> None:
         ntl = px * sz
@@ -644,6 +742,7 @@ class Simulator:
             "mid": mid, "inv_after": book.inv[coin], "latency_s": LATENCY_API_S,
             "queue_aware": queue, "cap": book.cap(self.mids),
             "equity": book.equity(self.mids),
+            "git_rev": read_git_rev(),
         }))
 
     def _resolve_as(self, now: float) -> None:
@@ -659,10 +758,17 @@ class Simulator:
                 adv = -sign * move
                 for h, tag in ((1, "1s"), (5, "5s"), (30, "30s"), (60, "1m"), (300, "5m")):
                     done = f"done_{tag}"
-                    if not getattr(p, done) and now - p.t >= h:
-                        setattr(book, f"as_{tag}_sum", getattr(book, f"as_{tag}_sum") + adv * p.notional)
-                        setattr(book, f"as_{tag}_ntl", getattr(book, f"as_{tag}_ntl") + p.notional)
-                        setattr(p, done, True)
+                    if getattr(p, done):
+                        continue
+                    age = now - p.t
+                    if age < h:
+                        continue
+                    tol = AS_TOLERANCE_S.get(tag, 0.0)
+                    setattr(p, done, True)
+                    if age > h + tol:
+                        continue  # horizon already passed; do not accumulate a late mid
+                    setattr(book, f"as_{tag}_sum", getattr(book, f"as_{tag}_sum") + adv * p.notional)
+                    setattr(book, f"as_{tag}_ntl", getattr(book, f"as_{tag}_ntl") + p.notional)
                 if not (p.done_1s and p.done_5s and p.done_30s and p.done_1m and p.done_5m):
                     still.append(p)
             book.pending_as = still
@@ -695,9 +801,10 @@ class Simulator:
                     continue
                 new_spread, new_refresh = target
                 ds = max(-MAX_SPREAD_STEP, min(MAX_SPREAD_STEP, new_spread - b.spread))
-                dr = max(-MAX_REFRESH_STEP_S, min(MAX_REFRESH_STEP_S, new_refresh - b.refresh_s))
-                b.spread = max(MIN_SPREAD, min(MAX_SPREAD, b.spread + ds))
-                b.refresh_s = max(MIN_REFRESH_S, min(MAX_REFRESH_S, b.refresh_s + dr))
+                b.spread = max(RECAL_MIN_SPREAD, min(MAX_SPREAD, b.spread + ds))
+                if new_refresh is not None:
+                    dr = max(-MAX_REFRESH_STEP_S, min(MAX_REFRESH_STEP_S, new_refresh - b.refresh_s))
+                    b.refresh_s = max(MIN_REFRESH_S, min(MAX_REFRESH_S, b.refresh_s + dr))
                 b.last_recal_at = now
                 b.n_recals += 1
             self.store.insert_event(
@@ -706,8 +813,31 @@ class Simulator:
             self.store.commit()
 
     def _fit_from_observer(self, since: float):
-        """Median of PROMISSOR makers only (viable + PnL>0 or activity proxy)."""
-        makers = self.store.promissor_makers(since)
+        """Median of PROMISSOR makers over the compact 14d hist (fallback: latest)."""
+        hist = []
+        try:
+            hist = self.store.promissor_hist(since)
+        except Exception:
+            hist = []
+        if hist:
+            groups = {}
+            for m in hist:
+                gkey = (m.get("venue"), m.get("maker_id"), m.get("coin"))
+                groups.setdefault(gkey, []).append(m)
+            makers = []
+            for rows in groups.values():
+                nears = [r["median_near_bps"] for r in rows if r.get("median_near_bps") is not None]
+                cycles = [
+                    r["median_cycle_s"] for r in rows
+                    if r.get("median_cycle_s") is not None and r.get("cycle_usable")
+                ]
+                sample = dict(rows[-1])
+                sample["median_near_bps"] = statistics.median(nears) if nears else None
+                sample["median_cycle_s"] = statistics.median(cycles) if cycles else None
+                sample["cycle_usable"] = bool(cycles)
+                makers.append(sample)
+        else:
+            makers = self.store.promissor_makers(since)
         # one vote per account per param set: same venue+account on BTC and HYPE
         # with ~equal near/cycle counts once; different params count per (★) market row.
         seen = set()
@@ -729,8 +859,16 @@ class Simulator:
         if not makers:
             return None  # no param change if nobody passes the filter
         spreads = [m["median_near_bps"] / 1e4 for m in makers if m.get("median_near_bps") is not None]
-        cycles = [m["median_cycle_s"] for m in makers if m.get("median_cycle_s") is not None]
-        if not spreads or not cycles:
+        cycles = []
+        for m in makers:
+            cyc = m.get("median_cycle_s")
+            if cyc is None:
+                continue
+            # Lighter cycles are usable; HL only when not censored by the poll gap.
+            if m.get("venue") == "hl" and not m.get("cycle_usable"):
+                continue
+            cycles.append(cyc)
+        if not spreads:
             return None
         regimes = self.store.recent_market_regimes(max(since, time.time() - 3600))
         rvols = [r[1] for r in regimes if r[1] is not None]
@@ -741,4 +879,6 @@ class Simulator:
                 vol_scale = 1.25
             elif med < 0.0003:
                 vol_scale = 0.9
-        return statistics.median(spreads) * vol_scale, max(3.0, statistics.median(cycles))
+        spread = max(RECAL_MIN_SPREAD, statistics.median(spreads) * vol_scale)
+        refresh = max(3.0, statistics.median(cycles)) if cycles else None
+        return spread, refresh

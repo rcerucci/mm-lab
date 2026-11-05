@@ -27,7 +27,7 @@ Opcional: `ROOT="$PWD" bash start.sh` inicia um supervisor em background que rei
 - `lab.py`: integra observer, simulador, persistência e dashboard.
 - `painel.py`, `status.py`: visualização terminal e resumo.
 - `config.py`, `storage.py`: parâmetros e armazenamento.
-- `tests/`: testes offline do simulador (`python -m pytest -q tests`).
+- `tests/`: testes offline do simulador e dos helpers do observer (`python -m pytest -q tests`).
 - `PRE_REGISTRO.md`: desenho e limitações do experimento original; sigma é o ambiente original, não um requisito.
 
 A publicação exclui ambientes virtuais, bancos, logs, estados, histórico, PIDs, backups e credenciais. Nunca adicione segredos. Nenhum modo de trading real é habilitado.
@@ -37,6 +37,6 @@ Read-only market-making research lab using public Hyperliquid and Lighter data, 
 
 Use the Linux/Python 3.10+ commands above: create a virtual environment, install requirements, then run `lab.py` for observer and simulator together. In another terminal, use `painel.py` for the dashboard, `painel.py --once` or `status.py` for snapshots. Exit the dashboard with q/Q/Esc/Ctrl+C. Fresh runs need time to accumulate history. Timezone: America/Sao_Paulo.
 
-A/B/C/D compare fixed/daily/three-day/weekly recalibration. FIX/CMP compare fixed and equity-linked simulated inventory caps; A has 5/20 bps neighbors. See config and the Portuguese pre-registration. Fills, queue position, latency and observed maker PnL are imperfect approximations; Lighter activity is a proxy when reliable PnL is unavailable. This is research, not investment advice or evidence of live profitability.
+A/B/C/D compare fixed/daily/three-day/weekly recalibration. FIX/CMP compare fixed and equity-linked simulated inventory caps; A has 5/20 bps neighbors. See config and the Portuguese pre-registration. Fills, queue position, latency and observed maker PnL are imperfect approximations; after the 5 Nov 2026 clean restart, cancelled quotes stay fillable for ~280 ms, inventory caps use gross notional, and Lighter presence (not seeded snaps or fills) is the activity proxy when reliable PnL is unavailable. This is research, not investment advice or evidence of live profitability.
 
 Runtime data, virtual environments, PIDs, backups and credentials are excluded. Never add secrets. No live trading is enabled.

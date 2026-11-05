@@ -108,6 +108,28 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_market_t ON market_state(t);
                 CREATE INDEX IF NOT EXISTS idx_maker_snap_t ON maker_snap(t);
                 CREATE INDEX IF NOT EXISTS idx_events_t ON events(t);
+                CREATE TABLE IF NOT EXISTS maker_hist (
+                  t REAL NOT NULL,
+                  venue TEXT NOT NULL,
+                  maker_id TEXT NOT NULL,
+                  coin TEXT NOT NULL,
+                  first_seen REAL,
+                  last_seen REAL,
+                  n_snaps INTEGER,
+                  median_cycle_s REAL,
+                  cycle_usable INTEGER,
+                  median_near_bps REAL,
+                  median_size_usd REAL,
+                  pause_frac REAL,
+                  est_pnl REAL,
+                  maker_fills INTEGER,
+                  viable INTEGER,
+                  promissor INTEGER,
+                  pnl_known INTEGER,
+                  poll_gap_s REAL
+                );
+                CREATE INDEX IF NOT EXISTS idx_maker_hist_t ON maker_hist(t);
+                CREATE INDEX IF NOT EXISTS idx_maker_hist_promissor ON maker_hist(promissor, t);
                 """
             )
             c.commit()
@@ -118,6 +140,52 @@ class Store:
             if "pnl_known" not in cols:
                 c.execute("ALTER TABLE maker_stats ADD COLUMN pnl_known INTEGER DEFAULT 0")
             c.commit()
+
+    def insert_maker_hist(self, row: Dict[str, Any]) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO maker_hist(
+                       t,venue,maker_id,coin,first_seen,last_seen,n_snaps,
+                       median_cycle_s,cycle_usable,median_near_bps,median_size_usd,
+                       pause_frac,est_pnl,maker_fills,viable,promissor,pnl_known,
+                       poll_gap_s
+                   ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    row["t"],
+                    row["venue"],
+                    row["maker_id"],
+                    row["coin"],
+                    row.get("first_seen"),
+                    row.get("last_seen"),
+                    row.get("n_snaps", 0),
+                    row.get("median_cycle_s"),
+                    1 if row.get("cycle_usable") else 0,
+                    row.get("median_near_bps"),
+                    row.get("median_size_usd"),
+                    row.get("pause_frac"),
+                    row.get("est_pnl"),
+                    row.get("maker_fills", 0),
+                    1 if row.get("viable") else 0,
+                    1 if row.get("promissor") else 0,
+                    1 if row.get("pnl_known") else 0,
+                    row.get("poll_gap_s"),
+                ),
+            )
+
+    def promissor_hist(self, since: float) -> List[Dict[str, Any]]:
+        """Compact 14d history of promissor snapshots (one vote later per maker)."""
+        with self._lock:
+            cur = self.conn.execute(
+                """SELECT t,venue,maker_id,coin,first_seen,last_seen,n_snaps,
+                          median_cycle_s,cycle_usable,median_near_bps,median_size_usd,
+                          pause_frac,est_pnl,maker_fills,viable,promissor,pnl_known,
+                          poll_gap_s
+                   FROM maker_hist
+                   WHERE promissor=1 AND t >= ?""",
+                (since,),
+            )
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
 
     def insert_market(self, row: Dict[str, Any]) -> None:
         with self._lock:
@@ -243,6 +311,7 @@ class Store:
             self.conn.execute("DELETE FROM market_state WHERE t < ?", (older_than,))
             self.conn.execute("DELETE FROM maker_snap WHERE t < ?", (older_than,))
             self.conn.execute("DELETE FROM events WHERE t < ?", (older_than,))
+            self.conn.execute("DELETE FROM maker_hist WHERE t < ?", (older_than,))
             self.conn.commit()
             try:
                 self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -307,7 +376,7 @@ class Store:
     def counts(self) -> Dict[str, int]:
         with self._lock:
             out = {}
-            for table in ("market_state", "maker_snap", "maker_stats", "events"):
+            for table in ("market_state", "maker_snap", "maker_stats", "maker_hist", "events"):
                 out[table] = self.conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             return out
 

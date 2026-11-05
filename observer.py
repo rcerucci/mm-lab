@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import json
+import math
 import statistics
 import time
 import urllib.request
@@ -36,11 +37,48 @@ from config import (
     VIABLE_MIN_LAYERS,
     VIABLE_MIN_SIZE_USD,
     PROMISSOR_MIN_SNAPS,
-    PROMISSOR_MIN_FILLS_PROXY,
+    PROMISSOR_MIN_PRESENCE_S,
     PROMISSOR_MIN_CYCLE_SAMPLES,
-    PROMISSOR_MIN_SNAPS_ONLY,
+    HL_CYCLE_CENSOR_MULT,
 )
 from storage import Store
+
+
+def hl_trade_maker(side: Optional[str], users) -> Optional[str]:
+    """Hyperliquid trade `users` is [buyer, seller].
+    Side A = taker sold, so the maker is the buyer (users[0]).
+    Side B = taker bought, so the maker is the seller (users[1]).
+    """
+    if not isinstance(users, list) or len(users) < 2:
+        return None
+    if side == "B":
+        maker = users[1]
+    elif side == "A":
+        maker = users[0]
+    else:
+        return None
+    if isinstance(maker, str) and maker.startswith("0x"):
+        return maker.lower()
+    return None
+
+
+def is_hl_trigger_order(order: Dict[str, Any]) -> bool:
+    if not isinstance(order, dict):
+        return True
+    if order.get("isTrigger"):
+        return True
+    ot = str(order.get("orderType") or "").lower().replace(" ", "")
+    return ot in {
+        "trigger", "stop", "stoplimit", "stopmarket",
+        "takeprofit", "takeprofitmarket", "takeprofitlimit",
+    }
+
+
+def realized_vol_from_returns(rets: List[float]) -> Optional[float]:
+    """1-minute realized vol = sqrt(sum of squared tick returns)."""
+    if len(rets) < 5:
+        return None
+    return math.sqrt(sum(r * r for r in rets))
 
 
 def _median(xs: List[float]) -> Optional[float]:
@@ -85,6 +123,8 @@ class MakerTracker:
         self.skews: Deque[float] = deque(maxlen=300)
         self.paused_flags: Deque[int] = deque(maxlen=300)
         self.cycle_samples: Deque[float] = deque(maxlen=200)
+        self.obs_gaps: Deque[float] = deque(maxlen=80)
+        self._last_obs_t: Optional[float] = None
         self.est_pnl = 0.0
         self.maker_fills = 0
         self.pnl_known = False  # True after HL userFills or Lighter trade pnl field
@@ -99,6 +139,9 @@ class MakerTracker:
         asks: List[Tuple[float, float]],
         order_ids: Optional[frozenset] = None,
     ) -> Dict[str, Any]:
+        if self._last_obs_t is not None and now > self._last_obs_t:
+            self.obs_gaps.append(now - self._last_obs_t)
+        self._last_obs_t = now
         self.last_seen = now
         self.n_snaps += 1
         if order_ids is None:
@@ -179,23 +222,30 @@ class MakerTracker:
         )
         n_cycles = len(samples)
         stable = n_cycles >= PROMISSOR_MIN_CYCLE_SAMPLES
+        presence = (
+            (time.time() - self.first_seen) >= PROMISSOR_MIN_PRESENCE_S
+            and self.n_snaps >= PROMISSOR_MIN_SNAPS
+        )
+        poll_gap = _median(list(self.obs_gaps)) if self.obs_gaps else None
+        cycle_usable = True
+        if self.venue == "hl":
+            if cycle is None:
+                cycle_usable = False
+            elif poll_gap is not None and poll_gap > 0:
+                cycle_usable = cycle >= HL_CYCLE_CENSOR_MULT * poll_gap
+            else:
+                cycle_usable = False
         if self.pnl_known:
             # known PnL: only winners feed recalibration
             promissor = bool(viable and self.est_pnl > 0)
         else:
-            # unknown PnL (typical Lighter): activity + stable cycle proxy.
-            # fills OR enough quote snaps (WS fill stream can miss).
-            activity = (
-                self.maker_fills >= PROMISSOR_MIN_FILLS_PROXY
-                or self.n_snaps >= PROMISSOR_MIN_SNAPS_ONLY
-            )
-            promissor = bool(
-                viable and stable and self.n_snaps >= PROMISSOR_MIN_SNAPS and activity
-            )
+            # unknown PnL (typical Lighter): presence + stable cycle, no fill OR
+            promissor = bool(viable and stable and presence)
         return {
             "venue": self.venue, "maker_id": self.maker_id, "coin": self.coin,
             "first_seen": self.first_seen, "last_seen": self.last_seen,
             "n_snaps": self.n_snaps, "median_cycle_s": cycle,
+            "cycle_usable": cycle_usable, "poll_gap_s": poll_gap,
             "median_near_bps": near, "median_size_usd": size,
             "median_layers": layers, "pause_frac": pause_frac,
             "est_pnl": self.est_pnl, "maker_fills": self.maker_fills,
@@ -246,7 +296,7 @@ class MarketFeatures:
                 if a > 0:
                     rets.append((b - a) / a)
             if rets:
-                rvol = statistics.pstdev(rets)
+                rvol = realized_vol_from_returns(rets)
                 if abs(rets[-1]) > 0.001:
                     spike = True
         vol_1m = sum(n for tt, n in self.trades_ntl if tt >= cutoff)
@@ -329,12 +379,8 @@ class Observer:
                 tr.est_pnl = float(pnl or 0)
             elif pnl and float(pnl) != 0:
                 tr.est_pnl = float(pnl)
-            # n_snaps will grow from observe; keep a floor so proxy can pass sooner
-            tr.n_snaps = max(tr.n_snaps, int(snaps or 0))
-            # seed cycle samples from last median so "stable" is not wiped by restart
-            if med_cycle and len(tr.cycle_samples) < PROMISSOR_MIN_CYCLE_SAMPLES:
-                for _ in range(PROMISSOR_MIN_CYCLE_SAMPLES):
-                    tr.cycle_samples.append(float(med_cycle))
+            # Do not restore n_snaps or fabricate cycle samples: presence and
+            # cycle stability must be earned live after a restart.
 
     async def run(self) -> None:
         self._seed_from_db()
@@ -497,6 +543,8 @@ class Observer:
                                 self.feat[("lighter", coin)].on_book(now, bids, asks)
 
                         elif "trade" in typ and coin is not None:
+                            if typ.startswith("subscribed"):
+                                continue
                             for tr in msg.get("trades") or []:
                                 try:
                                     px = float(tr["price"]); sz = float(tr["size"])
@@ -608,12 +656,10 @@ class Observer:
                                 self.n_hl_trades += 1
                                 self.feat[("hl", coin)].on_trade(now, px * sz)
                                 users = tr.get("users") or []
-                                if isinstance(users, list) and len(users) >= 2:
-                                    maker = users[1]
-                                    if isinstance(maker, str) and maker.startswith("0x"):
-                                        a = maker.lower()
-                                        self.hl_addrs[a] = now
-                                        self.hl_addr_score[a] += px * sz
+                                maker = hl_trade_maker(tr.get("side"), users)
+                                if maker:
+                                    self.hl_addrs[maker] = now
+                                    self.hl_addr_score[maker] += px * sz
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -674,6 +720,8 @@ class Observer:
             )
             if isinstance(oo, list):
                 for o in oo:
+                    if is_hl_trigger_order(o):
+                        continue
                     coin = o.get("coin")
                     if coin not in HL_COINS:
                         continue
@@ -708,19 +756,25 @@ class Observer:
                 try:
                     fills = _http_json(HL_INFO, {"type": "userFills", "user": addr}, timeout=12)
                     if isinstance(fills, list):
-                        # Prefer uncrossed (maker) fills; fall back to all closedPnl.
-                        maker_fills = [f for f in fills if f.get("crossed") is False]
-                        use = maker_fills if maker_fills else fills
-                        # recent-ish: keep last 500 by API order (newest first on HL)
-                        use = use[:500]
+                        # Prefer uncrossed (maker) BTC/HYPE fills. No fallback to
+                        # taker or other coins; leave pnl_known False if none.
+                        maker_fills = [
+                            f for f in fills
+                            if isinstance(f, dict)
+                            and f.get("crossed") is False
+                            and f.get("coin") in HL_COINS
+                        ]
+                        if not maker_fills:
+                            continue
+                        use = maker_fills[:500]
                         pnl = sum(float(f.get("closedPnl") or 0) for f in use)
-                        n_maker = len(maker_fills)
-                        self.hl_acct_pnl[addr.lower()] = (pnl, n_maker or len(use))
+                        n_maker = len(use)
+                        self.hl_acct_pnl[addr.lower()] = (pnl, n_maker)
                         for coin in HL_COINS:
                             tr = self.hl_makers.get((coin, addr.lower()))
                             if tr:
                                 tr.pnl_known = True
-                                tr.maker_fills = max(tr.maker_fills, n_maker or len(use))
+                                tr.maker_fills = max(tr.maker_fills, n_maker)
                                 tr.est_pnl = pnl
                 except Exception as e:
                     self._note_err("hl_fills", e)
@@ -748,8 +802,13 @@ class Observer:
 
     async def _summary_loop(self) -> None:
         while not self._stop.is_set():
+            now = time.time()
             for tr in list(self.lighter_makers.values()) + list(self.hl_makers.values()):
-                self.store.upsert_maker_stats(tr.summary())
+                row = tr.summary()
+                self.store.upsert_maker_stats(row)
+                hist = dict(row)
+                hist["t"] = now
+                self.store.insert_maker_hist(hist)
             # scrub stale viable flags (e.g. near_bps outliers from earlier rules)
             try:
                 self.store.scrub_stale_viable(

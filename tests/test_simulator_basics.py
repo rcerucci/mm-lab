@@ -127,3 +127,54 @@ def test_load_old_state_and_corrupt_backup(sim, tmp_path):
     s3 = Simulator(S.Store(tmp_path / "obs3.sqlite"))
     assert s3.books["A_FIX"].n_fills == 0
     assert list(tmp_path.glob("sim_state.json.bak-*"))
+
+
+def test_old_quote_lives_until_retire(sim):
+    b = _book(sim)
+    old = _quote(eff=0.0)
+    old.retire_at = 10.28
+    b.stale["BTC"] = old
+    nxt = _quote(eff=10.28)
+    nxt.bid_px = 98.0
+    b.quotes["BTC"] = nxt
+    sim._try_fill(b, "BTC", 99.0, 0.1, "A", now=10.0)
+    assert b.n_fills == 1 and b.inv["BTC"] == pytest.approx(0.1)
+    assert old.bid_sz == pytest.approx(0.4)
+    assert nxt.bid_sz == pytest.approx(0.5)
+    sim._try_fill(b, "BTC", 98.0, 0.1, "A", now=10.28)
+    assert b.n_fills == 2
+    assert nxt.bid_sz == pytest.approx(0.4)
+    assert b.stale["BTC"] is None
+
+
+def test_pause_keeps_quote_until_retire(sim):
+    b = _book(sim)
+    b.quotes["BTC"] = _quote(eff=0.0)
+    b.paused = True
+    sim._retire_quote(b, "BTC", now=5.0)
+    assert b.quotes["BTC"].retire_at == pytest.approx(5.28)
+    sim._try_fill(b, "BTC", 99.0, 0.1, "A", now=5.1)
+    assert b.n_fills == 1
+    sim._try_fill(b, "BTC", 99.0, 0.1, "A", now=5.28)
+    assert b.n_fills == 1
+    assert b.quotes["BTC"] is None
+
+
+def test_gross_cap_offsets_do_not_cancel(sim):
+    b = _book(sim)
+    b.inv["BTC"] = 0.6
+    b.inv["HYPE"] = -5.0
+    assert b.inv_usd(sim.mids) == pytest.approx(10.0)
+    assert b.inv_usd_gross(sim.mids) == pytest.approx(110.0)
+    assert sim._would_respect_cap(b, "BTC", "buy", 0.1, 100.0) is False
+    assert sim._would_respect_cap(b, "BTC", "sell", 0.1, 100.0) is True
+
+
+def test_as_discards_late_horizon(sim):
+    b = _book(sim)
+    fill(sim, "buy", 100, 1)
+    sim.mids["BTC"] = 99.0
+    sim._resolve_as(10.0)
+    assert b.as_1s_ntl == 0 and b.as_5s_ntl == 0
+    assert b.pending_as[0].done_1s and b.pending_as[0].done_5s
+    assert not b.pending_as[0].done_30s
