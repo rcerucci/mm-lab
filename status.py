@@ -84,10 +84,13 @@ def main() -> None:
                 f"fee2x=${b.get('pnl_net_2x',0):.4f} fund=${b.get('funding_pnl',0):.4f}"
             )
             if as1 is not None:
-                as5 = (b["as_5m_sum"] / b["as_5m_ntl"]) if b.get("as_5m_ntl") else None
+                def _a(tag):
+                    n = b.get(f"as_{tag}_ntl")
+                    return (b[f"as_{tag}_sum"] / n * 1e4) if n else float("nan")
                 print(
-                    f"  AS 1m: {as1*1e4:.2f} bps | AS 5m: "
-                    f"{(as5*1e4 if as5 is not None else float('nan')):.2f} bps"
+                    "  AS bps: " + " | ".join(
+                        f"{t} {_a(t):.2f}" for t in ("1s", "5s", "30s", "1m", "5m")
+                    )
                 )
             nxt = b.get("next_recal_s")
             if nxt is not None:

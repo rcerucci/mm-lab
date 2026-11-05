@@ -27,6 +27,7 @@ Opcional: `ROOT="$PWD" bash start.sh` inicia um supervisor em background que rei
 - `lab.py`: integra observer, simulador, persistência e dashboard.
 - `painel.py`, `status.py`: visualização terminal e resumo.
 - `config.py`, `storage.py`: parâmetros e armazenamento.
+- `tests/`: testes offline do simulador (`python -m pytest -q tests`).
 - `PRE_REGISTRO.md`: desenho e limitações do experimento original; sigma é o ambiente original, não um requisito.
 
 A publicação exclui ambientes virtuais, bancos, logs, estados, histórico, PIDs, backups e credenciais. Nunca adicione segredos. Nenhum modo de trading real é habilitado.

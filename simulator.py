@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
@@ -41,6 +42,11 @@ from config import (
 from storage import Store, append_jsonl
 
 
+def _log(msg: str) -> None:
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts} America/Sao_Paulo] {msg}", flush=True)
+
+
 @dataclass
 class Quote:
     bid_px: float
@@ -63,6 +69,9 @@ class PendingAS:
     mid_at_fill: float
     side: str
     notional: float
+    done_1s: bool = False
+    done_5s: bool = False
+    done_30s: bool = False
     done_1m: bool = False
     done_5m: bool = False
 
@@ -88,6 +97,12 @@ class ArmBook:
     n_buys: int = 0
     n_sells: int = 0
     volume_usd: float = 0.0
+    as_1s_sum: float = 0.0
+    as_1s_ntl: float = 0.0
+    as_5s_sum: float = 0.0
+    as_5s_ntl: float = 0.0
+    as_30s_sum: float = 0.0
+    as_30s_ntl: float = 0.0
     as_1m_sum: float = 0.0
     as_1m_ntl: float = 0.0
     as_5m_sum: float = 0.0
@@ -96,6 +111,7 @@ class ArmBook:
     avg_entry: Dict[str, float] = field(default_factory=lambda: {c: 0.0 for c in HL_COINS})
     last_refresh: Dict[str, float] = field(default_factory=dict)
     last_recal_at: float = 0.0
+    as_short_since: float = 0.0  # when 1s/5s/30s AS started being measured
     n_recals: int = 0
     paused: bool = False
     neighbor: bool = False
@@ -230,11 +246,18 @@ class Simulator:
     def _maybe_load(self) -> None:
         if not SIM_STATE_PATH.exists():
             return
+        import copy
+        _fresh_snapshot = copy.deepcopy({k: v for k, v in self.__dict__.items() if k != "store"})
         try:
             raw = json.loads(SIM_STATE_PATH.read_text())
             # only restore if schema matches ($100 + mode field)
             sample = next(iter((raw.get("books") or {}).values()), {})
             if sample.get("mode") not in CAP_MODES or raw.get("initial_equity") != INITIAL_EQUITY:
+                bak = self._backup_state()
+                _log(
+                    f"sim state NOT loaded: schema mismatch (mode={sample.get('mode')!r}, "
+                    f"initial_equity={raw.get('initial_equity')!r}); starting fresh; backup={bak}"
+                )
                 return
             self.started_at = raw.get("started_at", self.started_at)
             self._fill_seq = raw.get("fill_seq", 0)
@@ -249,6 +272,8 @@ class Simulator:
                 for attr in (
                     "usdc", "fees_paid", "fees_paid_2x", "realized_pnl", "funding_pnl",
                     "n_fills", "n_fills_opt", "n_buys", "n_sells", "volume_usd",
+                    "as_1s_sum", "as_1s_ntl", "as_5s_sum", "as_5s_ntl",
+                    "as_30s_sum", "as_30s_ntl",
                     "as_1m_sum", "as_1m_ntl", "as_5m_sum", "as_5m_ntl", "n_recals",
                     "paused", "spread", "refresh_s",
                 ):
@@ -258,7 +283,24 @@ class Simulator:
                 b.avg_entry = braw.get("avg_entry", b.avg_entry)
                 b.last_refresh = braw.get("last_refresh", {})
                 b.last_recal_at = braw.get("last_recal_at", self.started_at)
-                b.pending_as = [PendingAS(**p) for p in braw.get("pending_as", []) if "coin" in p]
+                _pf = PendingAS.__dataclass_fields__
+                b.pending_as = []
+                for p in braw.get("pending_as", []):
+                    if "coin" not in p:
+                        continue
+                    pa = PendingAS(**{k: v for k, v in p.items() if k in _pf})
+                    if "done_1s" not in p:
+                        # pre-upgrade fill: its 1s/5s/30s mid was never sampled;
+                        # skip those horizons instead of using a stale late mid
+                        pa.done_1s = pa.done_5s = pa.done_30s = True
+                    b.pending_as.append(pa)
+                if "as_short_since" in braw:
+                    b.as_short_since = braw["as_short_since"]
+                else:
+                    b.as_short_since = time.time()
+                    for tag in ("1s", "5s", "30s"):
+                        setattr(b, f"as_{tag}_sum", 0.0)
+                        setattr(b, f"as_{tag}_ntl", 0.0)
                 for c, qraw in (braw.get("quotes") or {}).items():
                     if qraw:
                         defaults = {
@@ -268,8 +310,22 @@ class Simulator:
                         }
                         defaults.update(qraw)
                         b.quotes[c] = Quote(**{k: defaults[k] for k in Quote.__dataclass_fields__})
-        except Exception:
-            pass
+        except Exception as e:  # noqa: BLE001
+            bak = self._backup_state()
+            _log(f"sim state LOAD FAILED: {type(e).__name__}: {e}; starting fresh; backup={bak}")
+            # reset any partially loaded books to fresh state
+            self.__dict__.update(_fresh_snapshot)
+            return
+
+    @staticmethod
+    def _backup_state() -> Optional[str]:
+        try:
+            bak = SIM_STATE_PATH.with_name(f"{SIM_STATE_PATH.name}.bak-{int(time.time())}")
+            shutil.copy2(SIM_STATE_PATH, bak)
+            return str(bak)
+        except Exception as e:  # noqa: BLE001
+            _log(f"sim state backup FAILED: {type(e).__name__}: {e}")
+            return None
 
     def save(self) -> None:
         payload: Dict[str, Any] = {
@@ -300,6 +356,10 @@ class Simulator:
                 "realized_pnl": b.realized_pnl, "funding_pnl": b.funding_pnl,
                 "n_fills": b.n_fills, "n_fills_opt": b.n_fills_opt,
                 "n_buys": b.n_buys, "n_sells": b.n_sells, "volume_usd": b.volume_usd,
+                "as_1s_sum": b.as_1s_sum, "as_1s_ntl": b.as_1s_ntl,
+                "as_5s_sum": b.as_5s_sum, "as_5s_ntl": b.as_5s_ntl,
+                "as_30s_sum": b.as_30s_sum, "as_30s_ntl": b.as_30s_ntl,
+                "as_short_since": b.as_short_since,
                 "as_1m_sum": b.as_1m_sum, "as_1m_ntl": b.as_1m_ntl,
                 "as_5m_sum": b.as_5m_sum, "as_5m_ntl": b.as_5m_ntl,
                 "avg_entry": b.avg_entry, "last_refresh": b.last_refresh,
@@ -525,26 +585,48 @@ class Simulator:
         ntl = px * sz
         fee = ntl * HL_MAKER_FEE
         fee2 = ntl * HL_MAKER_FEE_2X
+        old = book.inv[coin]
+        avg = book.avg_entry.get(coin, 0.0)
         if our_side == "buy":
             book.usdc -= ntl + fee
-            old = book.inv[coin]
             new = old + sz
-            if new != 0:
-                book.avg_entry[coin] = (
-                    (book.avg_entry[coin] * old + px * sz) / new if old > 0 else px
-                )
-            book.inv[coin] = new
+            if abs(new) < 1e-12:
+                new = 0.0
+            if old < 0:
+                cover = min(sz, -old)
+                book.realized_pnl += (avg - px) * cover
+                if new < 0:
+                    pass
+                elif new == 0:
+                    avg = 0.0
+                else:
+                    avg = px
+            elif old == 0:
+                avg = px
+            else:
+                avg = (avg * old + px * sz) / new
             book.n_buys += 1
         else:
             book.usdc += ntl - fee
-            old = book.inv[coin]
+            new = old - sz
+            if abs(new) < 1e-12:
+                new = 0.0
             if old > 0:
-                book.realized_pnl += (px - book.avg_entry[coin]) * min(sz, old)
-            book.inv[coin] = old - sz
-            if abs(book.inv[coin]) < 1e-12:
-                book.inv[coin] = 0.0
-                book.avg_entry[coin] = 0.0
+                close = min(sz, old)
+                book.realized_pnl += (px - avg) * close
+                if new > 0:
+                    pass
+                elif new == 0:
+                    avg = 0.0
+                else:
+                    avg = px
+            elif old == 0:
+                avg = px
+            else:
+                avg = (avg * old + px * (new - old)) / new
             book.n_sells += 1
+        book.inv[coin] = new
+        book.avg_entry[coin] = avg
         book.fees_paid += fee
         book.fees_paid_2x += fee2
         book.n_fills += 1
@@ -575,15 +657,13 @@ class Simulator:
                 sign = 1.0 if p.side == "buy" else -1.0
                 move = (mid - p.mid_at_fill) / p.mid_at_fill if p.mid_at_fill else 0.0
                 adv = -sign * move
-                if not p.done_1m and now - p.t >= 60:
-                    book.as_1m_sum += adv * p.notional
-                    book.as_1m_ntl += p.notional
-                    p.done_1m = True
-                if not p.done_5m and now - p.t >= 300:
-                    book.as_5m_sum += adv * p.notional
-                    book.as_5m_ntl += p.notional
-                    p.done_5m = True
-                if not (p.done_1m and p.done_5m):
+                for h, tag in ((1, "1s"), (5, "5s"), (30, "30s"), (60, "1m"), (300, "5m")):
+                    done = f"done_{tag}"
+                    if not getattr(p, done) and now - p.t >= h:
+                        setattr(book, f"as_{tag}_sum", getattr(book, f"as_{tag}_sum") + adv * p.notional)
+                        setattr(book, f"as_{tag}_ntl", getattr(book, f"as_{tag}_ntl") + p.notional)
+                        setattr(p, done, True)
+                if not (p.done_1s and p.done_5s and p.done_30s and p.done_1m and p.done_5m):
                     still.append(p)
             book.pending_as = still
 

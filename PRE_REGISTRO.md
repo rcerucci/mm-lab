@@ -59,9 +59,16 @@ No relatório de **09/11 ~11:00 America/Sao_Paulo**, comparar:
 - FIX vs CMP no mesmo ritmo (ex.: B_FIX vs B_CMP): o composto remunera melhor sem estourar drawdown?
 - Ritmo A/B/C/D no modo vencedor: daily vs 3d vs weekly vs fixo.
 - Vizinhos 5/20 bps: robustez do 10 bps.
-- Métricas: **ret% sobre US$100**, equity, inv/cap%, fills (queue vs opt), AS 1m/5m, funding.
+- Métricas: **ret% sobre US$100**, equity, inv/cap%, fills (queue vs opt), AS 1m/5m (e, desde 05/11, também AS 1s/5s/30s como diagnóstico de pickoff), funding.
 
 Critério qualitativo (não pass/fail rígido): retorno positivo líquido de fees com AS controlada e inv/cap tipicamente &lt; 80%; CMP só “vence” se o ret% superar FIX sem piorar muito o AS.
+
+## Correções de 05/11 (sem mudar o modelo de fill)
+- PnL realizado e preço médio (`avg_entry`) de posições vendidas (abrir/aumentar/cobrir/inverter short) corrigidos; o equity já estava correto e não muda.
+- Carregamento do estado agora registra no log e faz backup (`sim_state.json.bak-<ts>`) em caso de falha ou schema divergente, em vez de recomeçar em silêncio.
+- AS medida também em 1 s, 5 s e 30 s (aditivo; 1m/5m mantidos). Horizontes curtos contam só fills a partir de `as_short_since` (deploy de 05/11 ~19:11 America/Sao_Paulo); fills anteriores não entram neles.
+- Testes offline em `tests/` (`python -m pytest -q tests`).
+- O modelo de latência de cancelamento/dados ficou **inalterado de propósito** durante a corrida ao vivo; fica para um restart limpo após o recorte de 09/11.
 
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  

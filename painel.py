@@ -259,6 +259,12 @@ def _short_acct(mid: str) -> str:
     return mid[-8:]
 
 
+def _arm_as(b: Dict[str, Any], tag: str) -> Optional[float]:
+    if b.get(f"as_{tag}_ntl"):
+        return b[f"as_{tag}_sum"] / b[f"as_{tag}_ntl"] * 1e4
+    return None
+
+
 def _arm_as1m(b: Dict[str, Any]) -> Optional[float]:
     if b.get("as_1m_ntl"):
         return b["as_1m_sum"] / b["as_1m_ntl"] * 1e4
@@ -380,6 +386,7 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     arms.add_column("Cap", justify="right")
     arms.add_column("Inv%", justify="right")
     arms.add_column("F/O", justify="right", no_wrap=True, min_width=7)
+    arms.add_column("AS5s", justify="right")
     arms.add_column("AS1m", justify="right")
     arms.add_column("Fund", justify="right")
     arms.add_column("Recal", justify="right")
@@ -432,6 +439,7 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
             f"${b.get('cap', 0):.0f}",
             inv_s,
             f"{nf}/{no}",
+            _fmt_bps(_arm_as(b, "5s")),
             _fmt_bps(_arm_as1m(b)),
             fund_s,
             recal,
