@@ -129,6 +129,7 @@ Pacote aplicado sobre `f2c1ed6` / `81dad6f`. Se a revisão não apontar mais nad
 - Depois de um fill, a irmã só é recotada se lados e tamanhos mudarem (`reason=post_fill`); se forem iguais, a fila dela permanece. Timer, jump e `pause_resume` continuam substituindo mesmo com tamanho igual — senão o `refresh_s` morreria.
 - Fallback `promissor_makers` (só quando `maker_hist` está vazio) continua filtrando apenas `last_seen` na janela de 14 dias. `maker_stats` não tem coluna `cycle_usable`, então nesse caminho os ciclos da HL são ignorados (`not None`). O caminho principal é `promissor_hist`, que já traz `cycle_usable`. Sem migração de schema nesta rodada.
 - Limitação documentada, inalterada: `MAX_TRACKED_HL=40` pares `(coin, addr)` vs até 40 endereços no poll (a evicção descarta `n_snaps`/`first_seen` do par frio); piso de 10 bps aplicado depois do `vol_scale`; campos mortos `bid_sz_tt` / `pending_as_tt` / `force` (os `tt` ficam por compatibilidade de load); sem histerese no 98%; `near_bps` é mediana de até 3 pontas (não o toque); `hl_addr_score` acumula sem decaimento.
+- Painel (sem restart do paper): coluna `F/O` virou `F/O/T` (`n_fills` / `n_fills_opt` / `n_fills_through`); colunas `Além` (`sum n_quotes_beyond` / `sum n_quotes_placed`) e `Paus` (`sum n_pauses`); extras com totais through/além/paus. `userfills_oldest_age_s` **não** aparece — vive só no `MakerTracker` em memória e não está em `sim_state` / `maker_stats` (exigiria mudança no observer/lab + restart).
 
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  

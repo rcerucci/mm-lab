@@ -259,6 +259,25 @@ def _short_acct(mid: str) -> str:
     return mid[-8:]
 
 
+
+def _sum_dict_or_int(val: Any) -> int:
+    """Sum a per-coin dict counter, or accept a bare int; missing/bad → 0."""
+    if val is None:
+        return 0
+    if isinstance(val, dict):
+        total = 0
+        for v in val.values():
+            try:
+                total += int(v or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _arm_as(b: Dict[str, Any], tag: str) -> Optional[float]:
     if b.get(f"as_{tag}_ntl"):
         return b[f"as_{tag}_sum"] / b[f"as_{tag}_ntl"] * 1e4
@@ -344,6 +363,19 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     fills_tot = sum(int(b.get("n_fills") or 0) for b in books.values())
     fills_h = fills_tot / uptime_h if uptime_h > 0.01 else 0.0
     extras.append(f"fills/h≈{fills_h:.0f}  ", style="cyan")
+    through_tot = sum(
+        int(b.get("n_fills_through") if b.get("n_fills_through") is not None else b.get("n_fills_tt") or 0)
+        for b in books.values()
+    )
+    beyond_tot = sum(_sum_dict_or_int(b.get("n_quotes_beyond")) for b in books.values())
+    placed_tot = sum(_sum_dict_or_int(b.get("n_quotes_placed")) for b in books.values())
+    pauses_tot = sum(_sum_dict_or_int(b.get("n_pauses")) for b in books.values())
+    extras.append(f"through={through_tot}  ", style="cyan")
+    if placed_tot > 0:
+        extras.append(f"além={beyond_tot}/{placed_tot}  ", style="yellow")
+    else:
+        extras.append("além=—  ", style="dim")
+    extras.append(f"paus={pauses_tot}  ", style="dim")
     makers_all = _load_makers()
     viable_list = [m for m in makers_all if _is_viable(m)]
     prom_list = [m for m in makers_all if m.get("promissor")]
@@ -385,7 +417,9 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     arms.add_column("Ret%", justify="right")
     arms.add_column("Cap", justify="right")
     arms.add_column("Inv%", justify="right")
-    arms.add_column("F/O", justify="right", no_wrap=True, min_width=7)
+    arms.add_column("F/O/T", justify="right", no_wrap=True, min_width=9)
+    arms.add_column("Além", justify="right", no_wrap=True, min_width=7)
+    arms.add_column("Paus", justify="right", no_wrap=True)
     arms.add_column("AS5s", justify="right")
     arms.add_column("AS1m", justify="right")
     arms.add_column("Fund", justify="right")
@@ -426,6 +460,15 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
             recal = f"{nxt/3600:.1f}h"
         nf = int(b.get("n_fills") or 0)
         no = int(b.get("n_fills_opt") or 0)
+        nt_raw = b.get("n_fills_through")
+        if nt_raw is None:
+            nt_raw = b.get("n_fills_tt")
+        nt = int(nt_raw or 0)
+        placed = _sum_dict_or_int(b.get("n_quotes_placed"))
+        beyond = _sum_dict_or_int(b.get("n_quotes_beyond"))
+        alem = f"{beyond}/{placed}" if placed > 0 else "—"
+        pauses = _sum_dict_or_int(b.get("n_pauses"))
+        paus_s = str(pauses) if ("n_pauses" in b) else "—"
         fund = b.get("funding_pnl")
         fund_s = f"${fund:+.3f}" if fund is not None else "—"
         spark = _spark(pnl_hist.get(key, []), 12)
@@ -438,7 +481,9 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
             ret_t,
             f"${b.get('cap', 0):.0f}",
             inv_s,
-            f"{nf}/{no}",
+            f"{nf}/{no}/{nt}",
+            alem,
+            paus_s,
             _fmt_bps(_arm_as(b, "5s")),
             _fmt_bps(_arm_as1m(b)),
             fund_s,
@@ -558,7 +603,7 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     layout.split_column(
         Layout(Align.left(title), name="head", size=1),
         Layout(Panel(health, title="[bold]Health[/]", border_style="magenta", padding=(0, 1)), name="health", size=3),
-        Layout(Panel(extras, title="[bold]Extras[/] fills/h · ★promissor · viable · A FIX/CMP · B recal", border_style="bright_black", padding=(0, 1)), name="extras", size=3),
+        Layout(Panel(extras, title="[bold]Extras[/] fills/h · through · além · paus · ★promissor · viable · A FIX/CMP · B recal", border_style="bright_black", padding=(0, 1)), name="extras", size=3),
         Layout(name="main", size=18),
         Layout(Panel(mkt, title="[bold]Mercado[/] BTC/HYPE · HL & Lighter", border_style="yellow", padding=(0, 1)), name="mkt", size=8),
     )

@@ -78,8 +78,23 @@ def main() -> None:
                 f"cap=${b.get('cap',0):.2f} inv/cap={b.get('inv_cap_pct',0):.1f}% "
                 f"ord=${b.get('order_usd',0):.1f}"
             )
+            nt = b.get("n_fills_through")
+            if nt is None:
+                nt = b.get("n_fills_tt", 0)
+            def _sum_di(v):
+                if isinstance(v, dict):
+                    return sum(int(x or 0) for x in v.values())
+                try:
+                    return int(v or 0)
+                except (TypeError, ValueError):
+                    return 0
+            placed = _sum_di(b.get("n_quotes_placed"))
+            beyond = _sum_di(b.get("n_quotes_beyond"))
+            pauses = _sum_di(b.get("n_pauses"))
+            alem = f"{beyond}/{placed}" if placed else "—"
             print(
-                f"  fills={b['n_fills']} (opt={b.get('n_fills_opt',0)}) "
+                f"  fills={b['n_fills']} (opt={b.get('n_fills_opt',0)} through={nt}) "
+                f"além={alem} paus={pauses} "
                 f"vol=${b['volume_usd']:.2f} pnl=${b.get('pnl_net',0):.4f} "
                 f"fee2x=${b.get('pnl_net_2x',0):.4f} fund=${b.get('funding_pnl',0):.4f}"
             )
