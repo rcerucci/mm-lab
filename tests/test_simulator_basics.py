@@ -136,13 +136,15 @@ def test_old_quote_lives_until_retire(sim):
     nxt = _quote(eff=10.28)
     nxt.bid_px = 98.0
     b.quotes["BTC"] = [old, nxt]
-    sim._try_fill(b, "BTC", 99.0, 0.1, "A", now=10.0)
+    # use _try_fill_one so a post-fill requote does not rewrite the injected chain
+    sim._try_fill_one(b, "BTC", 99.0, 0.1, "A", now=10.0, q=old)
     assert b.n_fills == 1 and b.inv["BTC"] == pytest.approx(0.1)
     assert old.bid_sz == pytest.approx(0.4)
     assert nxt.bid_sz == pytest.approx(0.5)
-    sim._try_fill(b, "BTC", 98.0, 0.1, "A", now=10.28)
+    sim._try_fill_one(b, "BTC", 98.0, 0.1, "A", now=10.28, q=nxt)
     assert b.n_fills == 2
     assert nxt.bid_sz == pytest.approx(0.4)
+    sim._sweep_expired(b, "BTC", 10.28)
     assert old not in b.quotes["BTC"]
 
 
@@ -188,12 +190,12 @@ def test_chained_replace_keeps_middle_quote(sim):
     c = _quote(eff=0.48)
     c.bid_px = 97.0
     b.quotes["BTC"] = [a, bb, c]
-    sim._try_fill(b, "BTC", 99.0, 0.1, "A", now=0.30)
+    sim._try_fill_one(b, "BTC", 99.0, 0.1, "A", now=0.30, q=a)
     assert b.n_fills == 1
     assert a.bid_sz == pytest.approx(0.4)
     assert bb.bid_sz == pytest.approx(0.5)
     assert c.bid_sz == pytest.approx(0.5)
-    sim._try_fill(b, "BTC", 99.0, 0.1, "A", now=0.40)
+    sim._try_fill_one(b, "BTC", 99.0, 0.1, "A", now=0.40, q=bb)
     assert b.n_fills == 2
     assert bb.bid_sz == pytest.approx(0.4)
     assert c.bid_sz == pytest.approx(0.5)
@@ -254,10 +256,78 @@ def test_reducing_residual_is_allowed(sim):
 def test_trade_through_counts_separately(sim):
     b = _book(sim)
     q = _quote(qa=5.0)
-    q.bid_sz_tt = 0.5
     b.quotes["BTC"] = [q]
     sim._try_fill(b, "BTC", 98.9, 0.2, "A", now=1.0)
-    assert b.n_fills == 0
+    assert b.n_fills == 1
+    assert q.bid_sz == pytest.approx(0.0)
+    assert b.n_fills_through == 1
     assert b.n_fills_tt == 1
-    assert q.bid_sz_tt == pytest.approx(0.3)
+    assert b.n_fills_through <= b.n_fills
+
+
+def test_touch_high_queue_does_not_fill(sim):
+    b = _book(sim)
+    q = _quote(qa=5.0)
+    b.quotes["BTC"] = [q]
+    sim._try_fill(b, "BTC", 99.0, 0.2, "A", now=1.0)
+    assert b.n_fills == 0
+    assert b.n_fills_through == 0
     assert q.bid_sz == pytest.approx(0.5)
+    assert q.bid_queue_ahead == pytest.approx(4.8)
+
+
+def test_empty_on_purpose_does_not_churn(sim):
+    b = _book(sim)
+    sim.books_l2["BTC"] = ([(99.9, 1.0)] * 10, [(100.1, 1.0)] * 10)
+    sim._place(b, "BTC", now=0.0)
+    assert sim._current_quote(b, "BTC") is not None
+    n1 = b.n_replaces["BTC"]
+    b.inv["HYPE"] = 10.0  # BTC flat, book at the $100 cap
+    sim._place(b, "BTC", now=1.0)
+    assert b.intentionally_flat["BTC"] is True
+    assert b.n_replaces["BTC"] == n1 + 1
+    n2 = b.n_replaces["BTC"]
+    for t in (1.05, 1.10, 1.20, 1.50):
+        sim.maybe_refresh(t)
+    assert b.n_replaces["BTC"] == n2
+
+
+def test_requote_both_coins_after_fill_no_overshoot_on_reduce(sim):
+    b = _book(sim)
+    sim.books_l2["BTC"] = ([(99.9, 1.0)] * 10, [(100.1, 1.0)] * 10)
+    sim.books_l2["HYPE"] = ([(9.99, 1.0)] * 10, [(10.01, 1.0)] * 10)
+    sim._place(b, "BTC", now=0.0)
+    sim._place(b, "HYPE", now=0.0)
+    n_btc = b.n_replaces["BTC"]
+    n_hype = b.n_replaces["HYPE"]
+    over0 = b.n_cap_overshoot
+    b.inv["BTC"] = 0.5
+    b.inv["HYPE"] = 2.0
+    q = _quote(qa=0.0)
+    q.bid_sz = 0.0
+    q.ask_sz = 0.2
+    q.ask_queue_ahead = 0.0
+    b.quotes["BTC"] = [q]
+    sim._try_fill(b, "BTC", 101.0, 0.2, "B", now=1.0)
+    assert b.n_fills == 1
+    assert b.inv["BTC"] == pytest.approx(0.3)
+    assert b.n_cap_overshoot == over0
+    assert b.n_replaces["BTC"] == n_btc + 1
+    assert b.n_replaces["HYPE"] == n_hype + 1
+    assert b.replace_reasons["BTC"].get("post_fill", 0) >= 1
+    assert b.replace_reasons["HYPE"].get("post_fill", 0) >= 1
+
+
+def test_rvol_uses_1s_locf_grid():
+    from observer import MarketFeatures
+    feat = MarketFeatures()
+    t0 = 1_000.0
+    mid = 100.0
+    for i in range(30):
+        feat.mids.append((t0 + i * 0.02, mid))
+        mid *= 1.001
+    feat.best_bid, feat.best_ask = 103.0, 103.02
+    snap = feat.snapshot(t0 + 10.0)
+    assert snap["rvol_1m"] is not None
+    # 1s LOCF compresses the 30 intra-second ticks into a single 1s return
+    assert snap["rvol_1m"] < 0.05

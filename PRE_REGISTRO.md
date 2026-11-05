@@ -79,7 +79,7 @@ O paper da tarde (pós `40e5fe7`) não conta como corrida oficial. Histórico j�
 - AS: se `now - t > horizonte + tolerância` (1s→1s, 5s→2s, 30s→5s, 1m→15s, 5m→30s), o horizonte é marcado e o mid atrasado não entra na média.
 - `frontendOpenOrders` ignora triggers (`isTrigger` / `orderType` de stop ou take-profit).
 - Proxy Lighter: sem fabricar amostras de ciclo nem restaurar `n_snaps` no seed; presença = 80 snaps e 5 min no livro.
-- PnL HL: só maker BTC/HYPE, sem fallback. rvol de 1 min = √(soma dos retornos tick ao quadrado em 60s); limiares 0,0003 / 0,0008 passam a ler essa escala.
+- PnL HL: só maker BTC/HYPE, sem fallback. rvol de 1 min = √(soma dos retornos tick ao quadrado em 60s); limiares 0,0003 / 0,0008 passam a ler essa escala. (Na 3ª, o rvol passou a ser grade de 1 s com LOCF, não retorno por tick.)
 - Recal B/C/D: piso de 10 bps (A5 continua vizinho fixo). Ciclo mediano só da Lighter e da HL não censurada (ciclo ≥ 2× o intervalo de poll). Histórico compacto `maker_hist` escrito no loop de sumário, para a janela de 14 dias ser real daqui para frente.
 - `git_rev` entra em `sim_state.json` e em cada linha de fill; o arquivo `VERSION` acompanha o deploy.
 - 09/11 ~11:00 America/Sao_Paulo segue sendo porte de encanamento + diagnóstico A5/A10/A20, não escolha de ritmo A/B/C/D nem de FIX vs CMP.
@@ -92,10 +92,28 @@ O paper iniciado às 19:32 America/Sao_Paulo (git_rev `418d7f7`) também não co
 - Pausa é por (braço, moeda), com cooldown `max(5 s, refresh_s)` contado a partir do início.
 - Fill que reduz o bruto é sempre permitido (`projetado <= bruto atual`). Tamanho de redução = `min(ordem, posição)`; residual abaixo de US$ 10 ainda pode zerar. Estouro do teto (janela de 0,28 s) é preenchido e registrado (`n_cap_overshoot`, `max_cap_overshoot`).
 - Handoff é uma lista de cotações com intervalos `[effective_at, retire_at)` — um segundo replace não apaga a cotação do meio.
-- Dois limites de fill: fila (piso, PnL do paper) e trade-through estrito `px < bid` / `px > ask` (teto, só diagnóstico: `n_fills_tt` e AS correspondente).
-- AS usa o `time` da HL; `mid_at_fill` é o último book estritamente anterior ao trade; horizontes de 1 s e 5 s interpolam em `t+h`. Cobertura = amostras válidas / vistas por horizonte (`as_seen` / `as_discard`).
+- Dois limites de fill: fila (piso, PnL do paper) e trade-through estrito `px < bid` / `px > ask` (nessa versão o TT era um mundo paralelo; a 3ª passou a tratá-lo como tag do fill do paper, não como teto diagnóstico).
+- AS usa o `time` da HL; `mid_at_fill` é o último book estritamente anterior ao trade; horizontes de 1 s e 5 s interpolavam em `t+h` (na 3ª, LOCF com corte de buraco). Cobertura = amostras válidas / vistas por horizonte (`as_seen` / `as_discard`).
 - Recal: um voto por `(venue, maker_id)`; `promissor_hist` ordena por `t`.
-- `n_replaces` por moeda; a 30 s o esperado é ~120/h.
+- `n_replaces` por moeda; a 30 s o ~120/h era a cadência do timer, mas `MID_JUMP_TRIGGER=0,5` (5 bps contra o `ref_mid` num spread de 10 bps) torna isso um piso, não a expectativa — ver 3ª.
+
+## Correções de 05/11 (noite, 3ª) — código publicado, paper não reiniciado
+Este pacote entra no repositório público, mas o paper no sigma **não foi reiniciado**. A corrida atual continua no `git_rev` `d0c049d` até um restart explícito.
+
+- Through é uma tag dos fills do piso, não um mundo paralelo com tamanho restante próprio. Se `px < bid_px - eps` (simétrico no ask), `queue_ahead` vai a zero e o fill é o tamanho restante inteiro; `_clamp_reduce` continua só no piso. Contadores: `n_fills_through`, `volume_through` e AS com flag `through` em `PendingAS`. Vale `through ≤ n_fills` por construção; `n_fills − through` são os fills de toque que passaram pela fila. `n_fills_opt` segue como diagnóstico separado. Não se reporta o invariante agregado `n_fills_tt ≤ n_fills ≤ n_fills_opt` (eram mundos independentes).
+- Estado vazio de propósito: quando os dois lados saem com tamanho 0, o braço marca `intentionally_flat` e não incrementa `n_replaces` a cada `l2Book`. Reavalia só no `refresh_s`, em `sides_edge` ou depois de um fill.
+- Depois de qualquer fill, requote cobre as duas moedas do braço (`reason=post_fill`), porque o fill muda bruto, folga e lados permitidos da irmã. A reação usa o instante do trade, sem latência extra de WS; a cotação nova ainda nasce com 0,28 s de latência de API.
+- Estouro do teto (`n_cap_overshoot`) só conta quando `gross_after > gross_before` **e** `gross_after > cap`. Fill que reduz o bruto não incrementa, mesmo que a conta ainda esteja acima do teto.
+- `n_replaces` ganha motivos (`timer`, `jump`, `sides_edge`, `pause_resume`, `post_fill`). `MID_JUMP_TRIGGER=0,5` significa salto de 5 bps contra o `ref_mid` (num spread de 10 bps); ~120/h pelo timer é piso, não meta. Pausa 3× o spread continua alcançável (`0,5 < 3`). `n_pauses` é por moeda; o ramo morto `was_paused and not coin_paused` saiu — o retorno da pausa é `pause_resume` quando `q is None`.
+- `_mid_at` passou a LOCF (último sample com `ts ≤ t`). Se os samples em volta atravessam um buraco maior que `MID_GAP_S` (3 s), devolve `None`. Sem interpolação linear. O fallback de `_mid_before` (mid atual quando não há book anterior ao trade) é contado em `n_mid_before_fallback`. O descarte de AS usa o último book **daquela moeda**, não o `now` da outra.
+- Reconexão WS: a partir da segunda conexão, `on_ws_reconnect` retira as cotações, marca o gap e zera `intentionally_flat` para reavaliar os lados. A primeira conexão não conta como reconexão. Trades repetidos são ignorados por `tid` (ou `hash`).
+- AS e pausas por moeda (`as_coin_*`, `n_pauses`). Cada cotação registra `beyond_visible_bid` / `beyond_visible_ask` quando o preço fica abaixo do pior bid visível (ou acima do pior ask) em `BOOK_DEPTH_FOR_QUEUE=10`.
+- `recent_market_regimes` deixa de forçar `rvol None → 0,0`; `None` permanece `None` e o filtro `is not None` no recal continua válido.
+- Makers fantasma: `_summary_loop` não escreve `maker_hist` se `now - last_seen > MAKER_HIST_STALE_S` (300 s); o upsert de stats continua. `promissor_hist` filtra pelo `t` da escrita, então parar de renovar `t` faz o voto envelhecer na janela de 14 dias.
+- Evento de recal inclui `n_by_venue` e a mediana por venue (spread e ciclo). A política de pooling não muda: Lighter promissor = presença + ciclo estável (sem PnL); HL com PnL conhecido exige `est_pnl > 0`. `MAX_TRACKED_LIGHTER=80` é o total, não 30 por moeda.
+- PnL de `userFills`: ordena por `time` descendente, janela de 24 h (`USERFILLS_WINDOW_S`) em vez de `[:500]`, e soma `closedPnl - fee` (fee negativa é rebate e soma). Conservador se o `closedPnl` da HL já vier líquido de fee. Sem maker fills, o poll não dá `continue` — o `sleep(0,35)` roda. `observe_orders` usa `time.time()` por endereço, não o `now` do início do ciclo.
+- rvol: os mids de `MarketFeatures` são reamostrados numa grade de 1 s com LOCF (a fila `maxlen=600` encolhia a janela de 60 s quando o BTC atualiza mais de ~10 vezes por segundo).
+- Limitação documentada, sem código nesta rodada: não há histerese no 98%; `near_bps` é mediana de até 3 pontas por lado (camada do meio, não o toque); `hl_addr_score` acumula `px×sz` sem decaimento e só prioriza o poll — a cauda além de `MAX_TRACKED_HL=40` nunca é consultada, e a população é enviesada para quem imprime.
 
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  

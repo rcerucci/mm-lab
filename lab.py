@@ -59,12 +59,19 @@ class Lab:
 
     async def _hl_feed_for_sim(self) -> None:
         backoff = 1.0
+        ever_connected = False
         while not self._stop.is_set():
             try:
                 async with websockets.connect(
                     HL_WS, ping_interval=20, ping_timeout=20, max_size=8_000_000
                 ) as ws:
-                    log("sim HL WS connected")
+                    now = time.time()
+                    if ever_connected:
+                        self.sim.on_ws_reconnect(now)
+                        log("sim HL WS reconnected; quotes retired")
+                    else:
+                        log("sim HL WS connected")
+                    ever_connected = True
                     backoff = 1.0
                     for coin in HL_COINS:
                         await ws.send(json.dumps({
@@ -126,6 +133,11 @@ class Lab:
                                 try:
                                     px = float(tr["px"]); sz = float(tr["sz"]); side = tr["side"]
                                 except Exception:
+                                    continue
+                                tid = tr.get("tid")
+                                if tid is None:
+                                    tid = tr.get("hash")
+                                if not self.sim.note_tid(tid):
                                     continue
                                 self.sim.on_trade(coin, px, sz, side, _exch_time(tr, now))
                         if now - last_save > 10:

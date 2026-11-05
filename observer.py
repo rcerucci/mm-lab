@@ -27,6 +27,7 @@ from config import (
     LIGHTER_WS,
     MARKET_SNAP_S,
     MAKER_SUMMARY_S,
+    MAKER_HIST_STALE_S,
     MAX_TRACKED_HL,
     MAX_TRACKED_LIGHTER,
     ROLLING_WINDOW_S,
@@ -40,6 +41,7 @@ from config import (
     PROMISSOR_MIN_PRESENCE_S,
     PROMISSOR_MIN_CYCLE_SAMPLES,
     HL_CYCLE_CENSOR_MULT,
+    USERFILLS_WINDOW_S,
 )
 from storage import Store
 
@@ -75,7 +77,7 @@ def is_hl_trigger_order(order: Dict[str, Any]) -> bool:
 
 
 def realized_vol_from_returns(rets: List[float]) -> Optional[float]:
-    """1-minute realized vol = sqrt(sum of squared tick returns)."""
+    """1-minute realized vol = sqrt(sum of squared 1s (or caller-supplied) returns)."""
     if len(rets) < 5:
         return None
     return math.sqrt(sum(r * r for r in rets))
@@ -286,19 +288,34 @@ class MarketFeatures:
         if self.best_bid and self.best_ask:
             mid = (self.best_bid + self.best_ask) / 2.0
         cutoff = t - 60.0
-        recent = [(tt, m) for tt, m in self.mids if tt >= cutoff]
         rvol = None
         spike = False
-        if len(recent) >= 5:
-            rets = []
-            for i in range(1, len(recent)):
-                a, b = recent[i - 1][1], recent[i][1]
-                if a > 0:
-                    rets.append((b - a) / a)
-            if rets:
-                rvol = realized_vol_from_returns(rets)
-                if abs(rets[-1]) > 0.001:
-                    spike = True
+        samples = [(tt, m) for tt, m in self.mids if tt <= t]
+        if samples:
+            last = None
+            si = 0
+            while si < len(samples) and samples[si][0] <= cutoff:
+                last = samples[si][1]
+                si += 1
+            grid = []
+            start_s = int(math.floor(cutoff)) + 1
+            end_s = int(math.floor(t))
+            for s in range(start_s, end_s + 1):
+                while si < len(samples) and samples[si][0] <= float(s):
+                    last = samples[si][1]
+                    si += 1
+                if last is not None:
+                    grid.append((s, last))
+            if len(grid) >= 6:
+                rets = []
+                for i in range(1, len(grid)):
+                    a, b = grid[i - 1][1], grid[i][1]
+                    if a > 0:
+                        rets.append((b - a) / a)
+                if rets:
+                    rvol = realized_vol_from_returns(rets)
+                    if abs(rets[-1]) > 0.001:
+                        spike = True
         vol_1m = sum(n for tt, n in self.trades_ntl if tt >= cutoff)
         imb = self.imbalance
         if self.bid_levels and self.ask_levels:
@@ -745,7 +762,7 @@ class Observer:
                     continue
                 tr = self._get_hl_tracker(coin, addr)
                 snap = tr.observe_orders(
-                    now, mid, sides["bids"], sides["asks"], frozenset(sides["oids"])
+                    time.time(), mid, sides["bids"], sides["asks"], frozenset(sides["oids"])
                 )
                 try:
                     self.store.insert_maker_snap(snap)
@@ -764,18 +781,29 @@ class Observer:
                             and f.get("crossed") is False
                             and f.get("coin") in HL_COINS
                         ]
-                        if not maker_fills:
-                            continue
-                        use = maker_fills[:500]
-                        pnl = sum(float(f.get("closedPnl") or 0) for f in use)
-                        n_maker = len(use)
-                        self.hl_acct_pnl[addr.lower()] = (pnl, n_maker)
-                        for coin in HL_COINS:
-                            tr = self.hl_makers.get((coin, addr.lower()))
-                            if tr:
-                                tr.pnl_known = True
-                                tr.maker_fills = max(tr.maker_fills, n_maker)
-                                tr.est_pnl = pnl
+                        if maker_fills:
+                            def _fill_t(f):
+                                try:
+                                    raw = float(f.get("time") or 0)
+                                except (TypeError, ValueError):
+                                    return 0.0
+                                return raw / 1000.0 if raw > 1e12 else raw
+                            maker_fills.sort(key=_fill_t, reverse=True)
+                            cutoff = time.time() - USERFILLS_WINDOW_S
+                            use = [f for f in maker_fills if _fill_t(f) >= cutoff]
+                            pnl = 0.0
+                            for f in use:
+                                closed = float(f.get("closedPnl") or 0)
+                                fee = float(f.get("fee") or 0)
+                                pnl += closed - fee
+                            n_maker = len(use)
+                            self.hl_acct_pnl[addr.lower()] = (pnl, n_maker)
+                            for coin in HL_COINS:
+                                tr = self.hl_makers.get((coin, addr.lower()))
+                                if tr:
+                                    tr.pnl_known = True
+                                    tr.maker_fills = max(tr.maker_fills, n_maker)
+                                    tr.est_pnl = pnl
                 except Exception as e:
                     self._note_err("hl_fills", e)
             time.sleep(0.35)
@@ -806,6 +834,9 @@ class Observer:
             for tr in list(self.lighter_makers.values()) + list(self.hl_makers.values()):
                 row = tr.summary()
                 self.store.upsert_maker_stats(row)
+                last_seen = float(tr.last_seen or 0)
+                if now - last_seen > MAKER_HIST_STALE_S:
+                    continue
                 hist = dict(row)
                 hist["t"] = now
                 self.store.insert_maker_hist(hist)

@@ -372,7 +372,7 @@ class Store:
                    ORDER BY t""",
                 (since,),
             )
-            return [(r[0], r[1] or 0.0, r[2] or 0.0) for r in cur.fetchall()]
+            return [(r[0], r[1], r[2] if r[2] is not None else 0.0) for r in cur.fetchall()]
 
     def counts(self) -> Dict[str, int]:
         with self._lock:

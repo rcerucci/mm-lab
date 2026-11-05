@@ -70,6 +70,9 @@ MIN_REFRESH_S = 5.0
 MAX_REFRESH_S = 120.0
 HL_CYCLE_CENSOR_MULT = 2.0  # HL cycle must exceed 2x observe gap
 AS_TOLERANCE_S = {"1s": 1.0, "5s": 2.0, "30s": 5.0, "1m": 15.0, "5m": 30.0}
+MID_GAP_S = 3.0  # do not interpolate/LOCF across a hole larger than this
+MAKER_HIST_STALE_S = 300.0  # skip maker_hist writes when last_seen is older
+USERFILLS_WINDOW_S = 86400.0  # comparable maker PnL window
 VERSION_PATH = ROOT / "VERSION"
 
 # Observer cadence

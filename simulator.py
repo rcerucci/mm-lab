@@ -41,6 +41,7 @@ from config import (
     SKEW_PER_USD,
     SPREAD_NEIGHBORS,
     AS_TOLERANCE_S,
+    MID_GAP_S,
     VERSION_PATH,
 )
 from storage import Store, append_jsonl
@@ -76,6 +77,8 @@ class Quote:
     ref_mid: Optional[float] = None
     bid_sz_tt: float = 0.0
     ask_sz_tt: float = 0.0
+    beyond_visible_bid: bool = False
+    beyond_visible_ask: bool = False
 
 
 @dataclass
@@ -86,6 +89,7 @@ class PendingAS:
     mid_at_fill: float
     side: str
     notional: float
+    through: bool = False
     done_1s: bool = False
     done_5s: bool = False
     done_30s: bool = False
@@ -113,9 +117,12 @@ class ArmBook:
     n_fills_opt: int = 0
     n_fills_tt: int = 0
     volume_tt: float = 0.0
+    n_fills_through: int = 0
+    volume_through: float = 0.0
     n_replaces: Dict[str, int] = field(default_factory=lambda: {c: 0 for c in HL_COINS})
     n_cap_overshoot: int = 0
     max_cap_overshoot: float = 0.0
+    n_mid_before_fallback: int = 0
     n_buys: int = 0
     n_sells: int = 0
     volume_usd: float = 0.0
@@ -151,6 +158,26 @@ class ArmBook:
     paused_until: Dict[str, float] = field(default_factory=dict)
     allowed_sides: Dict[str, Tuple[bool, bool]] = field(default_factory=dict)
     neighbor: bool = False
+    intentionally_flat: Dict[str, bool] = field(default_factory=dict)
+    n_pauses: Dict[str, int] = field(default_factory=lambda: {c: 0 for c in HL_COINS})
+    replace_reasons: Dict[str, Dict[str, int]] = field(
+        default_factory=lambda: {
+            c: {"timer": 0, "jump": 0, "sides_edge": 0, "pause_resume": 0, "post_fill": 0}
+            for c in HL_COINS
+        }
+    )
+    as_coin_sum: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {c: {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")} for c in HL_COINS}
+    )
+    as_coin_ntl: Dict[str, Dict[str, float]] = field(
+        default_factory=lambda: {c: {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")} for c in HL_COINS}
+    )
+    as_through_sum: Dict[str, float] = field(
+        default_factory=lambda: {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")}
+    )
+    as_through_ntl: Dict[str, float] = field(
+        default_factory=lambda: {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")}
+    )
 
     def paused_now(self, now: float) -> bool:
         return any(now < self.paused_until.get(c, 0.0) for c in HL_COINS)
@@ -236,6 +263,31 @@ def _queue_at_price(levels, px: float, side: str) -> Tuple[float, float]:
     return better, same
 
 
+REPLACE_REASONS = ("timer", "jump", "sides_edge", "pause_resume", "post_fill")
+
+
+def _bump_reason(book: ArmBook, coin: str, reason: str) -> None:
+    rec = book.replace_reasons.setdefault(
+        coin, {r: 0 for r in REPLACE_REASONS}
+    )
+    rec[reason] = rec.get(reason, 0) + 1
+
+
+def _primary_reason(reasons) -> str:
+    for cand in ("post_fill", "jump", "sides_edge", "pause_resume", "timer"):
+        if cand in reasons:
+            return cand
+    return "timer"
+
+
+def _beyond_visible(levels, px: float, side: str) -> bool:
+    if not levels:
+        return True
+    if side == "bid":
+        return px < levels[-1][0] - 1e-12
+    return px > levels[-1][0] + 1e-12
+
+
 def _build_arm_specs() -> List[Dict[str, Any]]:
     """A/B/C/D × FIX/CMP at 10 bps; A neighbors 5/20 × both modes."""
     specs = []
@@ -279,6 +331,9 @@ class Simulator:
         self.n_trades = 0
         self.n_books = 0
         self._fill_seq = 0
+        self._seen_tid_set = set()
+        self._seen_tid_q: deque = deque()
+        self._ws_reconnects = 0
         self.books: Dict[str, ArmBook] = {}
         self._periods: Dict[str, Optional[float]] = {}
         for spec in _build_arm_specs():
@@ -325,11 +380,13 @@ class Simulator:
                 for attr in (
                     "usdc", "fees_paid", "fees_paid_2x", "realized_pnl", "funding_pnl",
                     "n_fills", "n_fills_opt", "n_fills_tt", "volume_tt",
+                    "n_fills_through", "volume_through",
                     "n_buys", "n_sells", "volume_usd",
                     "as_1s_sum", "as_1s_ntl", "as_5s_sum", "as_5s_ntl",
                     "as_30s_sum", "as_30s_ntl",
                     "as_1m_sum", "as_1m_ntl", "as_5m_sum", "as_5m_ntl", "n_recals",
                     "n_cap_overshoot", "max_cap_overshoot",
+                    "n_mid_before_fallback",
                     "spread", "refresh_s",
                 ):
                     if attr in braw:
@@ -346,6 +403,33 @@ class Simulator:
                     b.paused_until = {c: until for c in HL_COINS}
                 if isinstance(braw.get("n_replaces"), dict):
                     b.n_replaces = {c: int(braw["n_replaces"].get(c, 0)) for c in HL_COINS}
+                if "n_fills_through" not in braw and "n_fills_tt" in braw:
+                    b.n_fills_through = int(braw.get("n_fills_tt") or 0)
+                    b.volume_through = float(braw.get("volume_tt") or 0)
+                if isinstance(braw.get("n_pauses"), dict):
+                    b.n_pauses = {c: int(braw["n_pauses"].get(c, 0)) for c in HL_COINS}
+                if isinstance(braw.get("replace_reasons"), dict):
+                    for c in HL_COINS:
+                        src = braw["replace_reasons"].get(c) or {}
+                        rec = b.replace_reasons.setdefault(c, {r: 0 for r in REPLACE_REASONS})
+                        for r, v in src.items():
+                            rec[r] = int(v)
+                if isinstance(braw.get("intentionally_flat"), dict):
+                    b.intentionally_flat = {c: bool(v) for c, v in braw["intentionally_flat"].items()}
+                if isinstance(braw.get("as_coin_sum"), dict):
+                    for c, hv in braw["as_coin_sum"].items():
+                        if isinstance(hv, dict):
+                            b.as_coin_sum.setdefault(c, {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")})
+                            b.as_coin_sum[c].update({k: float(v) for k, v in hv.items()})
+                if isinstance(braw.get("as_coin_ntl"), dict):
+                    for c, hv in braw["as_coin_ntl"].items():
+                        if isinstance(hv, dict):
+                            b.as_coin_ntl.setdefault(c, {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")})
+                            b.as_coin_ntl[c].update({k: float(v) for k, v in hv.items()})
+                if isinstance(braw.get("as_through_sum"), dict):
+                    b.as_through_sum.update({k: float(v) for k, v in braw["as_through_sum"].items()})
+                if isinstance(braw.get("as_through_ntl"), dict):
+                    b.as_through_ntl.update({k: float(v) for k, v in braw["as_through_ntl"].items()})
                 if isinstance(braw.get("as_seen"), dict):
                     b.as_seen.update({k: int(v) for k, v in braw["as_seen"].items()})
                 if isinstance(braw.get("as_discard"), dict):
@@ -456,10 +540,15 @@ class Simulator:
                 "fees_paid": b.fees_paid, "fees_paid_2x": b.fees_paid_2x,
                 "realized_pnl": b.realized_pnl, "funding_pnl": b.funding_pnl,
                 "n_fills": b.n_fills, "n_fills_opt": b.n_fills_opt,
-                "n_fills_tt": b.n_fills_tt, "volume_tt": b.volume_tt,
+                "n_fills_tt": b.n_fills_through, "volume_tt": b.volume_through,
+                "n_fills_through": b.n_fills_through, "volume_through": b.volume_through,
                 "n_replaces": b.n_replaces,
+                "replace_reasons": b.replace_reasons,
+                "n_pauses": b.n_pauses,
+                "intentionally_flat": b.intentionally_flat,
                 "n_cap_overshoot": b.n_cap_overshoot,
                 "max_cap_overshoot": b.max_cap_overshoot,
+                "n_mid_before_fallback": b.n_mid_before_fallback,
                 "n_buys": b.n_buys, "n_sells": b.n_sells, "volume_usd": b.volume_usd,
                 "as_1s_sum": b.as_1s_sum, "as_1s_ntl": b.as_1s_ntl,
                 "as_5s_sum": b.as_5s_sum, "as_5s_ntl": b.as_5s_ntl,
@@ -474,7 +563,9 @@ class Simulator:
                 "pending_as": [asdict(p) for p in b.pending_as],
                 "pending_as_tt": [asdict(p) for p in b.pending_as_tt],
                 "as_seen": b.as_seen, "as_discard": b.as_discard,
-                "as_tt_sum": b.as_tt_sum, "as_tt_ntl": b.as_tt_ntl,
+                "as_tt_sum": b.as_through_sum, "as_tt_ntl": b.as_through_ntl,
+                "as_through_sum": b.as_through_sum, "as_through_ntl": b.as_through_ntl,
+                "as_coin_sum": b.as_coin_sum, "as_coin_ntl": b.as_coin_ntl,
                 "as_coverage": {
                     k: (0.0 if not b.as_seen.get(k) else
                         1.0 - b.as_discard.get(k, 0) / b.as_seen[k])
@@ -549,6 +640,26 @@ class Simulator:
         for b in self.books.values():
             self._try_fill(b, coin, px, sz, side, now)
 
+    def note_tid(self, tid) -> bool:
+        """True if this exchange trade id is new and should be processed."""
+        if tid is None:
+            return True
+        if tid in self._seen_tid_set:
+            return False
+        self._seen_tid_set.add(tid)
+        self._seen_tid_q.append(tid)
+        if len(self._seen_tid_q) > 8000:
+            old = self._seen_tid_q.popleft()
+            self._seen_tid_set.discard(old)
+        return True
+
+    def on_ws_reconnect(self, now: float) -> None:
+        self._ws_reconnects += 1
+        for book in self.books.values():
+            for coin in HL_COINS:
+                self._retire_quote(book, coin, now)
+                book.intentionally_flat[coin] = False
+
     def _current_quote(self, book: ArmBook, coin: str):
         qs = book.quotes.get(coin) or []
         for q in reversed(qs):
@@ -598,7 +709,7 @@ class Simulator:
                 allow_ask = False
         return allow_bid, allow_ask
 
-    def _place(self, book: ArmBook, coin: str, now: float) -> None:
+    def _place(self, book: ArmBook, coin: str, now: float, reason: str = "timer") -> None:
         mid = self.mids.get(coin)
         bbo = self.bbo.get(coin)
         if mid is None or mid <= 0 or bbo is None or book.coin_paused(coin, now):
@@ -651,17 +762,30 @@ class Simulator:
 
         bid_sz = (bid_usd / mid) if bid_usd > 0 else 0.0
         ask_sz = (ask_usd / mid) if ask_usd > 0 else 0.0
+        if bid_sz <= 0 and ask_sz <= 0:
+            had_live = any(q.retire_at is None for q in (book.quotes.get(coin) or []))
+            if had_live:
+                for q in (book.quotes.get(coin) or []):
+                    if q.retire_at is None:
+                        q.retire_at = now + LATENCY_API_S
+                book.n_replaces[coin] = book.n_replaces.get(coin, 0) + 1
+                _bump_reason(book, coin, reason)
+            book.intentionally_flat[coin] = True
+            book.last_refresh[coin] = now
+            return
+
+        book.intentionally_flat[coin] = False
         for q in (book.quotes.get(coin) or []):
             if q.retire_at is None:
                 q.retire_at = now + LATENCY_API_S
         book.n_replaces[coin] = book.n_replaces.get(coin, 0) + 1
-        if bid_sz <= 0 and ask_sz <= 0:
-            book.last_refresh[coin] = now
-            return
+        _bump_reason(book, coin, reason)
 
         bids, asks = self.books_l2.get(coin, ([], []))
-        b_better, b_same = _queue_at_price(bids[:BOOK_DEPTH_FOR_QUEUE], bid_px, "bid") if bid_sz else (0.0, 0.0)
-        a_better, a_same = _queue_at_price(asks[:BOOK_DEPTH_FOR_QUEUE], ask_px, "ask") if ask_sz else (0.0, 0.0)
+        vis_bids = bids[:BOOK_DEPTH_FOR_QUEUE]
+        vis_asks = asks[:BOOK_DEPTH_FOR_QUEUE]
+        b_better, b_same = _queue_at_price(vis_bids, bid_px, "bid") if bid_sz else (0.0, 0.0)
+        a_better, a_same = _queue_at_price(vis_asks, ask_px, "ask") if ask_sz else (0.0, 0.0)
         nxt = Quote(
             bid_px=bid_px, ask_px=ask_px, bid_sz=bid_sz, ask_sz=ask_sz,
             placed_at=now, effective_at=now + LATENCY_API_S,
@@ -670,6 +794,8 @@ class Simulator:
             bid_sz_opt=bid_sz, ask_sz_opt=ask_sz,
             retire_at=None, ref_mid=mid,
             bid_sz_tt=bid_sz, ask_sz_tt=ask_sz,
+            beyond_visible_bid=_beyond_visible(vis_bids, bid_px, "bid") if bid_sz else False,
+            beyond_visible_ask=_beyond_visible(vis_asks, ask_px, "ask") if ask_sz else False,
         )
         book.quotes.setdefault(coin, []).append(nxt)
         book.last_refresh[coin] = now
@@ -683,41 +809,47 @@ class Simulator:
                 self._sweep_expired(book, coin, now)
                 q = self._current_quote(book, coin)
                 last = book.last_refresh.get(coin, 0.0)
-                was_paused = book.coin_paused(coin, now)
-                need = force or q is None or (now - last) >= book.refresh_s
+                flat = book.intentionally_flat.get(coin, False)
+                reasons = []
+                if force:
+                    reasons.append("timer")
+                if q is None and not flat:
+                    reasons.append("timer")
+                if (now - last) >= book.refresh_s:
+                    reasons.append("timer")
                 if q is not None and mid > 0:
                     ref = q.ref_mid if q.ref_mid else (q.bid_px + q.ask_px) / 2.0
                     if ref > 0 and abs(mid - ref) / mid > MID_JUMP_TRIGGER * book.spread:
-                        need = True
+                        reasons.append("jump")
                         if abs(mid - ref) / mid > 3 * book.spread:
                             if not book.coin_paused(coin, now):
                                 book.paused_until[coin] = now + max(5.0, book.refresh_s)
+                                book.n_pauses[coin] = book.n_pauses.get(coin, 0) + 1
                                 self._retire_quote(book, coin, now)
-                if was_paused and not book.coin_paused(coin, now):
-                    need = True
+                until = book.paused_until.get(coin, 0.0)
+                if until and now >= until and q is None:
+                    reasons.append("pause_resume")
                 sides = self._allowed_sides(book, coin)
                 prev = book.allowed_sides.get(coin)
                 if prev is not None and sides != prev:
-                    need = True
+                    reasons.append("sides_edge")
                 book.allowed_sides[coin] = sides
                 if book.coin_paused(coin, now):
                     self._retire_quote(book, coin, now)
-                elif need:
-                    self._place(book, coin, now)
+                elif reasons:
+                    self._place(book, coin, now, reason=_primary_reason(reasons))
 
     def _try_fill(self, book, coin, px, sz, side, now) -> None:
         qs = self._fillable_quotes(book, coin, now)
         if not qs:
             return
+        n_before = book.n_fills
         for q in qs:
             self._try_fill_one(book, coin, px, sz, side, now, q)
-        cur = self._current_quote(book, coin)
-        if (
-            cur is not None
-            and cur.bid_sz <= 0 and cur.ask_sz <= 0
-            and not book.coin_paused(coin, now)
-        ):
-            self._place(book, coin, now)
+        if book.n_fills > n_before:
+            for c in HL_COINS:
+                if not book.coin_paused(c, now):
+                    self._place(book, c, now, reason="post_fill")
 
     def _clamp_reduce(self, book, coin, side, sz) -> float:
         pos = book.inv.get(coin, 0.0)
@@ -726,20 +858,6 @@ class Simulator:
         if side == "sell" and pos > 0:
             return min(sz, pos)
         return sz
-
-    def _note_tt_fill(self, book, coin, side, px, sz, now) -> None:
-        if sz <= 0:
-            return
-        book.n_fills_tt += 1
-        book.volume_tt += px * sz
-        mid = self._mid_before(coin, now)
-        if mid is None:
-            mid = self.mids.get(coin, px)
-        self._fill_seq += 1
-        book.pending_as_tt.append(PendingAS(
-            fill_id=f"tt-{self._fill_seq}", coin=coin, t=now,
-            mid_at_fill=mid, side=side, notional=px * sz,
-        ))
 
     def _try_fill_one(self, book, coin, px, sz, side, now, q) -> None:
         # optimistic (no queue); kept as a count, not PnL
@@ -753,50 +871,61 @@ class Simulator:
             q.ask_sz_opt -= take
             if take > 0:
                 book.n_fills_opt += 1
-        # trade-through ceiling: strict px < bid / px > ask, no queue
-        if side == "A" and q.bid_sz_tt > 0 and px < q.bid_px - 1e-12:
-            take = min(q.bid_sz_tt, sz)
-            if take > 0:
-                self._note_tt_fill(book, coin, "buy", q.bid_px, take, now)
-                q.bid_sz_tt -= take
-        if side == "B" and q.ask_sz_tt > 0 and px > q.ask_px + 1e-12:
-            take = min(q.ask_sz_tt, sz)
-            if take > 0:
-                self._note_tt_fill(book, coin, "sell", q.ask_px, take, now)
-                q.ask_sz_tt -= take
-        # queue-aware floor (paper PnL): eat queue, then fill
-        if side == "A" and q.bid_sz > 0 and px <= q.bid_px + 1e-9:
-            remain = sz
-            if q.bid_queue_ahead > 0:
-                eat = min(q.bid_queue_ahead, remain)
-                q.bid_queue_ahead -= eat
-                remain -= eat
-            if remain > 0 and q.bid_queue_ahead <= 1e-15:
-                fill_sz = self._clamp_reduce(book, coin, "buy", min(q.bid_sz, remain))
+        # paper path: a strict trade-through zeros the queue and fills the rest
+        if side == "A" and q.bid_sz > 0:
+            through = px < q.bid_px - 1e-12
+            at_or_through = px <= q.bid_px + 1e-9
+            if through:
+                q.bid_queue_ahead = 0.0
+                fill_sz = self._clamp_reduce(book, coin, "buy", q.bid_sz)
                 if fill_sz > 0:
-                    self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now)
+                    self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=True)
                     q.bid_sz -= fill_sz
                     if q.bid_sz <= 1e-12:
                         q.bid_sz = 0.0
-        elif side == "A" and q.bid_sz > 0 and px > q.bid_px:
-            if q.bid_queue_ahead > 0:
-                q.bid_queue_ahead = max(0.0, q.bid_queue_ahead - sz)
-        if side == "B" and q.ask_sz > 0 and px >= q.ask_px - 1e-9:
-            remain = sz
-            if q.ask_queue_ahead > 0:
-                eat = min(q.ask_queue_ahead, remain)
-                q.ask_queue_ahead -= eat
-                remain -= eat
-            if remain > 0 and q.ask_queue_ahead <= 1e-15:
-                fill_sz = self._clamp_reduce(book, coin, "sell", min(q.ask_sz, remain))
+            elif at_or_through:
+                remain = sz
+                if q.bid_queue_ahead > 0:
+                    eat = min(q.bid_queue_ahead, remain)
+                    q.bid_queue_ahead -= eat
+                    remain -= eat
+                if remain > 0 and q.bid_queue_ahead <= 1e-15:
+                    fill_sz = self._clamp_reduce(book, coin, "buy", min(q.bid_sz, remain))
+                    if fill_sz > 0:
+                        self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=False)
+                        q.bid_sz -= fill_sz
+                        if q.bid_sz <= 1e-12:
+                            q.bid_sz = 0.0
+            elif px > q.bid_px:
+                if q.bid_queue_ahead > 0:
+                    q.bid_queue_ahead = max(0.0, q.bid_queue_ahead - sz)
+        if side == "B" and q.ask_sz > 0:
+            through = px > q.ask_px + 1e-12
+            at_or_through = px >= q.ask_px - 1e-9
+            if through:
+                q.ask_queue_ahead = 0.0
+                fill_sz = self._clamp_reduce(book, coin, "sell", q.ask_sz)
                 if fill_sz > 0:
-                    self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now)
+                    self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=True)
                     q.ask_sz -= fill_sz
                     if q.ask_sz <= 1e-12:
                         q.ask_sz = 0.0
-        elif side == "B" and q.ask_sz > 0 and px < q.ask_px:
-            if q.ask_queue_ahead > 0:
-                q.ask_queue_ahead = max(0.0, q.ask_queue_ahead - sz)
+            elif at_or_through:
+                remain = sz
+                if q.ask_queue_ahead > 0:
+                    eat = min(q.ask_queue_ahead, remain)
+                    q.ask_queue_ahead -= eat
+                    remain -= eat
+                if remain > 0 and q.ask_queue_ahead <= 1e-15:
+                    fill_sz = self._clamp_reduce(book, coin, "sell", min(q.ask_sz, remain))
+                    if fill_sz > 0:
+                        self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=False)
+                        q.ask_sz -= fill_sz
+                        if q.ask_sz <= 1e-12:
+                            q.ask_sz = 0.0
+            elif px < q.ask_px:
+                if q.ask_queue_ahead > 0:
+                    q.ask_queue_ahead = max(0.0, q.ask_queue_ahead - sz)
 
     def _projected_gross(self, book, coin, side, sz, px) -> float:
         notionals = {}
@@ -818,7 +947,7 @@ class Simulator:
     def _mid_before(self, coin: str, t: float):
         buf = self.mid_hist.get(coin)
         if not buf:
-            return self.mids.get(coin)
+            return None
         last = None
         for ts, mid in buf:
             if ts < t:
@@ -833,21 +962,24 @@ class Simulator:
             return None
         if t < buf[0][0]:
             return None
-        if t >= buf[-1][0]:
-            return None if t > buf[-1][0] else buf[-1][1]
-        prev = buf[0]
-        for cur in buf:
-            if cur[0] >= t:
-                t0, m0 = prev
-                t1, m1 = cur
-                if t1 <= t0:
-                    return m1
-                w = (t - t0) / (t1 - t0)
-                return m0 + w * (m1 - m0)
-            prev = cur
-        return None
+        last = None
+        last_ts = None
+        next_ts = None
+        for ts, mid in buf:
+            if ts <= t:
+                last = mid
+                last_ts = ts
+            else:
+                next_ts = ts
+                break
+        if last is None:
+            return None
+        if next_ts is not None and last_ts is not None and (next_ts - last_ts) > MID_GAP_S:
+            return None
+        return last
 
-    def _apply_fill(self, book, coin, our_side, px, sz, now, queue: bool = True) -> None:
+    def _apply_fill(self, book, coin, our_side, px, sz, now, queue: bool = True, through: bool = False) -> None:
+        gross_before = book.inv_usd_gross(self.mids) if self.mids else 0.0
         ntl = px * sz
         fee = ntl * HL_MAKER_FEE
         fee2 = ntl * HL_MAKER_FEE_2X
@@ -902,12 +1034,22 @@ class Simulator:
         mid = self._mid_before(coin, now)
         if mid is None:
             mid = self.mids.get(coin, px)
+            book.n_mid_before_fallback += 1
         book.pending_as.append(
-            PendingAS(fill_id=fid, coin=coin, t=now, mid_at_fill=mid, side=our_side, notional=ntl)
+            PendingAS(
+                fill_id=fid, coin=coin, t=now, mid_at_fill=mid, side=our_side,
+                notional=ntl, through=through,
+            )
         )
+        if through:
+            book.n_fills_through += 1
+            book.volume_through += ntl
+            book.n_fills_tt = book.n_fills_through
+            book.volume_tt = book.volume_through
         cap = book.cap(self.mids) if self.mids else INITIAL_EQUITY
-        over = book.inv_usd_gross(self.mids) - cap if self.mids else 0.0
-        if over > 1e-9:
+        gross_after = book.inv_usd_gross(self.mids) if self.mids else 0.0
+        if gross_after > gross_before + 1e-12 and gross_after > cap + 1e-9:
+            over = gross_after - cap
             book.n_cap_overshoot += 1
             book.max_cap_overshoot = max(book.max_cap_overshoot, over)
         append_jsonl(FILLS_PATH, json.dumps({
@@ -915,12 +1057,12 @@ class Simulator:
             "spread": book.spread, "refresh_s": book.refresh_s, "coin": coin,
             "side": our_side, "px": px, "sz": sz, "notional": ntl, "fee": fee,
             "mid": mid, "inv_after": book.inv[coin], "latency_s": LATENCY_API_S,
-            "queue_aware": queue, "cap": book.cap(self.mids),
+            "queue_aware": queue, "through": through, "cap": book.cap(self.mids),
             "equity": book.equity(self.mids),
             "git_rev": read_git_rev(),
         }))
 
-    def _sample_as(self, book, pending, now, into_tt: bool = False) -> None:
+    def _sample_as(self, book, pending, now) -> None:
         still = []
         for p in pending:
             sign = 1.0 if p.side == "buy" else -1.0
@@ -934,46 +1076,46 @@ class Simulator:
                 mid_h = self._mid_at(p.coin, p.t + h)
                 if mid_h is None:
                     buf = self.mid_hist.get(p.coin)
+                    coin_now = buf[-1][0] if buf else now
                     if not buf:
-                        if now > p.t + h + tol:
+                        if coin_now > p.t + h + tol:
                             setattr(p, done, True)
-                            if not into_tt:
-                                book.as_seen[tag] = book.as_seen.get(tag, 0) + 1
-                                book.as_discard[tag] = book.as_discard.get(tag, 0) + 1
+                            book.as_seen[tag] = book.as_seen.get(tag, 0) + 1
+                            book.as_discard[tag] = book.as_discard.get(tag, 0) + 1
                             continue
                         mid_h = self.mids.get(p.coin)
                         if mid_h is None:
                             continue
-                    elif now > p.t + h + tol:
+                    elif coin_now > p.t + h + tol:
                         setattr(p, done, True)
-                        if not into_tt:
-                            book.as_seen[tag] = book.as_seen.get(tag, 0) + 1
-                            book.as_discard[tag] = book.as_discard.get(tag, 0) + 1
+                        book.as_seen[tag] = book.as_seen.get(tag, 0) + 1
+                        book.as_discard[tag] = book.as_discard.get(tag, 0) + 1
                         continue
                     else:
                         continue
                 setattr(p, done, True)
-                if not into_tt:
-                    book.as_seen[tag] = book.as_seen.get(tag, 0) + 1
+                book.as_seen[tag] = book.as_seen.get(tag, 0) + 1
                 move = (mid_h - p.mid_at_fill) / p.mid_at_fill if p.mid_at_fill else 0.0
                 adv = -sign * move
-                if into_tt:
-                    book.as_tt_sum[tag] = book.as_tt_sum.get(tag, 0.0) + adv * p.notional
-                    book.as_tt_ntl[tag] = book.as_tt_ntl.get(tag, 0.0) + p.notional
-                else:
-                    setattr(book, f"as_{tag}_sum", getattr(book, f"as_{tag}_sum") + adv * p.notional)
-                    setattr(book, f"as_{tag}_ntl", getattr(book, f"as_{tag}_ntl") + p.notional)
+                weighted = adv * p.notional
+                setattr(book, f"as_{tag}_sum", getattr(book, f"as_{tag}_sum") + weighted)
+                setattr(book, f"as_{tag}_ntl", getattr(book, f"as_{tag}_ntl") + p.notional)
+                book.as_coin_sum.setdefault(p.coin, {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")})
+                book.as_coin_ntl.setdefault(p.coin, {k: 0.0 for k in ("1s", "5s", "30s", "1m", "5m")})
+                book.as_coin_sum[p.coin][tag] = book.as_coin_sum[p.coin].get(tag, 0.0) + weighted
+                book.as_coin_ntl[p.coin][tag] = book.as_coin_ntl[p.coin].get(tag, 0.0) + p.notional
+                if getattr(p, "through", False):
+                    book.as_through_sum[tag] = book.as_through_sum.get(tag, 0.0) + weighted
+                    book.as_through_ntl[tag] = book.as_through_ntl.get(tag, 0.0) + p.notional
+                    book.as_tt_sum[tag] = book.as_through_sum[tag]
+                    book.as_tt_ntl[tag] = book.as_through_ntl[tag]
             if not (p.done_1s and p.done_5s and p.done_30s and p.done_1m and p.done_5m):
                 still.append(p)
-        if into_tt:
-            book.pending_as_tt = still
-        else:
-            book.pending_as = still
+        book.pending_as = still
 
     def _resolve_as(self, now: float) -> None:
         for book in self.books.values():
-            self._sample_as(book, book.pending_as, now, into_tt=False)
-            self._sample_as(book, book.pending_as_tt, now, into_tt=True)
+            self._sample_as(book, book.pending_as, now)
 
     def maybe_recalibrate(self, now: float) -> None:
         since = now - ROLLING_WINDOW_S
@@ -1010,7 +1152,13 @@ class Simulator:
                 b.last_recal_at = now
                 b.n_recals += 1
             self.store.insert_event(
-                now, "recal", json.dumps({"recal_key": key, "target": target, "n_promissor": getattr(self, "_last_n_promissor", None)})
+                now, "recal", json.dumps({
+                    "recal_key": key,
+                    "target": target,
+                    "n_promissor": getattr(self, "_last_n_promissor", None),
+                    "n_by_venue": getattr(self, "_last_n_by_venue", None),
+                    "median_by_venue": getattr(self, "_last_median_by_venue", None),
+                })
             )
             self.store.commit()
 
@@ -1063,6 +1211,34 @@ class Simulator:
             uniq.append(sample)
         makers = uniq
         self._last_n_promissor = len(makers)
+        n_by_venue = {}
+        median_by_venue = {}
+        for m in makers:
+            v = m.get("venue") or "unknown"
+            n_by_venue[v] = n_by_venue.get(v, 0) + 1
+        for v in n_by_venue:
+            v_spreads = [
+                m["median_near_bps"] / 1e4
+                for m in makers
+                if (m.get("venue") or "unknown") == v and m.get("median_near_bps") is not None
+            ]
+            v_cycles = []
+            for m in makers:
+                if (m.get("venue") or "unknown") != v:
+                    continue
+                cyc = m.get("median_cycle_s")
+                if cyc is None:
+                    continue
+                if v == "hl" and not m.get("cycle_usable"):
+                    continue
+                v_cycles.append(cyc)
+            median_by_venue[v] = {
+                "n": n_by_venue[v],
+                "spread": statistics.median(v_spreads) if v_spreads else None,
+                "refresh_s": statistics.median(v_cycles) if v_cycles else None,
+            }
+        self._last_n_by_venue = n_by_venue
+        self._last_median_by_venue = median_by_venue
         if not makers:
             return None  # no param change if nobody passes the filter
         spreads = [m["median_near_bps"] / 1e4 for m in makers if m.get("median_near_bps") is not None]
