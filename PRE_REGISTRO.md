@@ -115,6 +115,21 @@ Este pacote entra no repositório público, mas o paper no sigma **não foi rein
 - rvol: os mids de `MarketFeatures` são reamostrados numa grade de 1 s com LOCF (a fila `maxlen=600` encolhia a janela de 60 s quando o BTC atualiza mais de ~10 vezes por segundo).
 - Limitação documentada, sem código nesta rodada: não há histerese no 98%; `near_bps` é mediana de até 3 pontas por lado (camada do meio, não o toque); `hl_addr_score` acumula `px×sz` sem decaimento e só prioriza o poll — a cauda além de `MAX_TRACKED_HL=40` nunca é consultada, e a população é enviesada para quem imprime.
 
+
+## Correções de 05/11 (noite, 4ª)
+Pacote aplicado sobre `f2c1ed6` / `81dad6f`. Se a revisão não apontar mais nada a corrigir, o paper no sigma recomeça limpo com este SHA.
+
+- `_load_quote` passa a preencher `beyond_visible_bid=False` e `beyond_visible_ask=False`. Um `sim_state.json` antigo sem esses campos deixava de carregar (`KeyError` → LOAD FAILED → book zerado).
+- LOCF em `_mid_at`: além do buraco interior `next_ts - last_ts > MID_GAP_S` (3 s) → `None`, a cauda sem sample seguinte também devolve `None` quando `(t - last_ts) > MID_GAP_S`. Evita marcar horizontes de AS com um mid parado depois de um book morto.
+- `pause_resume` só entra quando `last < until <= now` e `q is None`. `paused_until` nunca é limpo; a guarda impede reescrever `last_refresh` a cada `l2Book` depois da primeira retomada. Uma conta que já esteve vazia de propósito e tem pausa expirada não chacoalha `n_replaces`.
+- rvol: `MarketFeatures._note_mid` guarda um mid por segundo (substitui o último se `int(t)` for igual) com timestamp `int(t)`, para a grade LOCF (`ts <= s`) ver o último mid daquele segundo. `maxlen=600` cobre ~10 min, não 600 ticks.
+- `userFills`: se a janela de 24 h ficar vazia (`use == []`), o poll **não** marca `pnl_known=True` com `est_pnl=0` (conhecido perdedor, excluído do median). O PnL permanece desconhecido, como na Lighter. A idade do fill maker mais antigo usado vai em `userfills_oldest_t` / `userfills_oldest_age_s`.
+- Cada cotação efetivamente colocada incrementa `n_quotes_placed[coin]`; se algum lado estiver além do livro visível (`BOOK_DEPTH_FOR_QUEUE=10`), incrementa `n_quotes_beyond[coin]`. O flag `beyond_visible` entra em cada linha de `fills.jsonl`.
+- Fallback de `tid` quando a HL não manda `tid`: `(hash, px, sz, time)`, não o `hash` sozinho.
+- Depois de um fill, a irmã só é recotada se lados e tamanhos mudarem (`reason=post_fill`); se forem iguais, a fila dela permanece. Timer, jump e `pause_resume` continuam substituindo mesmo com tamanho igual — senão o `refresh_s` morreria.
+- Fallback `promissor_makers` (só quando `maker_hist` está vazio) continua filtrando apenas `last_seen` na janela de 14 dias. `maker_stats` não tem coluna `cycle_usable`, então nesse caminho os ciclos da HL são ignorados (`not None`). O caminho principal é `promissor_hist`, que já traz `cycle_usable`. Sem migração de schema nesta rodada.
+- Limitação documentada, inalterada: `MAX_TRACKED_HL=40` pares `(coin, addr)` vs até 40 endereços no poll (a evicção descarta `n_snaps`/`first_seen` do par frio); piso de 10 bps aplicado depois do `vol_scale`; campos mortos `bid_sz_tt` / `pending_as_tt` / `force` (os `tt` ficam por compatibilidade de load); sem histerese no 98%; `near_bps` é mediana de até 3 pontas (não o toque); `hl_addr_score` acumula sem decaimento.
+
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  
 - Sigma→HL: REST ~280 ms, WS ~470 ms. Viable: ciclo ≥3 s e 10–100 bps.

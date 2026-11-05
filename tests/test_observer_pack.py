@@ -8,7 +8,9 @@ from observer import (
     MakerTracker,
     hl_trade_maker,
     is_hl_trigger_order,
+    maker_fills_pnl,
     realized_vol_from_returns,
+    should_write_maker_hist,
 )
 
 
@@ -63,3 +65,32 @@ def test_hl_cycle_censored_by_poll_gap():
     tr.cycle_samples.append(40.0)
     s = tr.summary()
     assert s["cycle_usable"] is True
+
+
+def test_userfills_sort_window_fee_and_empty_use():
+    now = 1_700_000_000.0
+    fills = [
+        {"crossed": False, "coin": "BTC", "time": (now - 10) * 1000, "closedPnl": 5, "fee": 1},
+        {"crossed": False, "coin": "HYPE", "time": (now - 100) * 1000, "closedPnl": 3, "fee": 0.5},
+        {"crossed": False, "coin": "BTC", "time": (now - 90_000) * 1000, "closedPnl": 100, "fee": 0},
+        {"crossed": True, "coin": "BTC", "time": now * 1000, "closedPnl": 50, "fee": 0},
+        {"crossed": False, "coin": "ETH", "time": now * 1000, "closedPnl": 7, "fee": 0},
+    ]
+    use, pnl, n, oldest = maker_fills_pnl(fills, now, 86_400.0)
+    assert n == 2
+    assert len(use) == 2
+    assert pnl == pytest.approx((5 - 1) + (3 - 0.5))
+    assert oldest == pytest.approx(now - 100)
+    stale = [{"crossed": False, "coin": "BTC", "time": (now - 90_000) * 1000,
+              "closedPnl": 0, "fee": 0}]
+    use, pnl, n, oldest = maker_fills_pnl(stale, now, 86_400.0)
+    assert use == [] and n == 0 and oldest is None
+
+
+def test_ghost_hist_skipped_when_stale():
+    now = time.time()
+    tr = MakerTracker("hl", "0xabc", "BTC")
+    tr.last_seen = now - 301
+    assert should_write_maker_hist(tr, now, 300.0) is False
+    tr.last_seen = now - 10
+    assert should_write_maker_hist(tr, now, 300.0) is True

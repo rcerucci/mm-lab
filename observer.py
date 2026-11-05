@@ -83,6 +83,43 @@ def realized_vol_from_returns(rets: List[float]) -> Optional[float]:
     return math.sqrt(sum(r * r for r in rets))
 
 
+def _fill_time_s(fill: Dict[str, Any]) -> float:
+    try:
+        raw = float(fill.get("time") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return raw / 1000.0 if raw > 1e12 else raw
+
+
+def maker_fills_pnl(fills, now: float, window_s: float) -> Tuple[list, float, int, Optional[float]]:
+    """Filter uncrossed BTC/HYPE maker fills in the window; pnl = sum(closedPnl - fee).
+
+    Returns (use, pnl, n, oldest_t). An empty use means "unknown", not a known-zero loss.
+    """
+    maker_fills = [
+        f for f in (fills or [])
+        if isinstance(f, dict)
+        and f.get("crossed") is False
+        and f.get("coin") in HL_COINS
+    ]
+    if not maker_fills:
+        return [], 0.0, 0, None
+    maker_fills.sort(key=_fill_time_s, reverse=True)
+    cutoff = now - window_s
+    use = [f for f in maker_fills if _fill_time_s(f) >= cutoff]
+    if not use:
+        return [], 0.0, 0, None
+    pnl = 0.0
+    for f in use:
+        pnl += float(f.get("closedPnl") or 0) - float(f.get("fee") or 0)
+    oldest = min(_fill_time_s(f) for f in use)
+    return use, pnl, len(use), oldest
+
+
+def should_write_maker_hist(tr, now: float, stale_s: float) -> bool:
+    return (now - float(getattr(tr, "last_seen", 0) or 0)) <= stale_s
+
+
 def _median(xs: List[float]) -> Optional[float]:
     xs = [x for x in xs if x is not None]
     if not xs:
@@ -130,6 +167,8 @@ class MakerTracker:
         self.est_pnl = 0.0
         self.maker_fills = 0
         self.pnl_known = False  # True after HL userFills or Lighter trade pnl field
+        self.userfills_oldest_t: Optional[float] = None
+        self.userfills_oldest_age_s: Optional[float] = None
         self.n_snaps = 0
         self._last_change_t: Optional[float] = None
 
@@ -252,6 +291,8 @@ class MakerTracker:
             "median_layers": layers, "pause_frac": pause_frac,
             "est_pnl": self.est_pnl, "maker_fills": self.maker_fills,
             "viable": viable, "promissor": promissor, "pnl_known": self.pnl_known,
+            "userfills_oldest_t": self.userfills_oldest_t,
+            "userfills_oldest_age_s": self.userfills_oldest_age_s,
         }
 
 
@@ -273,12 +314,21 @@ class MarketFeatures:
         self.ask_levels = asks
         self.best_bid, self.best_ask = bids[0][0], asks[0][0]
         mid = (self.best_bid + self.best_ask) / 2.0
-        self.mids.append((t, mid))
+        self._note_mid(t, mid)
         self.imbalance = _imbalance(bids, asks, BOOK_DEPTH_FOR_IMB)
+
+    def _note_mid(self, t: float, mid: float) -> None:
+        # one sample per wall-clock second so maxlen=600 covers ~10 min, not 600 ticks.
+        # stamp at int(t) so the 1s LOCF grid (ts <= s) sees that second's last mid.
+        bucket = float(int(t))
+        if self.mids and int(self.mids[-1][0]) == int(t):
+            self.mids[-1] = (bucket, mid)
+        else:
+            self.mids.append((bucket, mid))
 
     def on_bbo(self, t: float, bid: float, ask: float) -> None:
         self.best_bid, self.best_ask = bid, ask
-        self.mids.append((t, (bid + ask) / 2.0))
+        self._note_mid(t, (bid + ask) / 2.0)
 
     def on_trade(self, t: float, ntl: float) -> None:
         self.trades_ntl.append((t, ntl))
@@ -775,35 +825,21 @@ class Observer:
                     if isinstance(fills, list):
                         # Prefer uncrossed (maker) BTC/HYPE fills. No fallback to
                         # taker or other coins; leave pnl_known False if none.
-                        maker_fills = [
-                            f for f in fills
-                            if isinstance(f, dict)
-                            and f.get("crossed") is False
-                            and f.get("coin") in HL_COINS
-                        ]
-                        if maker_fills:
-                            def _fill_t(f):
-                                try:
-                                    raw = float(f.get("time") or 0)
-                                except (TypeError, ValueError):
-                                    return 0.0
-                                return raw / 1000.0 if raw > 1e12 else raw
-                            maker_fills.sort(key=_fill_t, reverse=True)
-                            cutoff = time.time() - USERFILLS_WINDOW_S
-                            use = [f for f in maker_fills if _fill_t(f) >= cutoff]
-                            pnl = 0.0
-                            for f in use:
-                                closed = float(f.get("closedPnl") or 0)
-                                fee = float(f.get("fee") or 0)
-                                pnl += closed - fee
-                            n_maker = len(use)
+                        now_f = time.time()
+                        use, pnl, n_maker, oldest = maker_fills_pnl(
+                            fills, now_f, USERFILLS_WINDOW_S
+                        )
+                        if use:
                             self.hl_acct_pnl[addr.lower()] = (pnl, n_maker)
+                            age = now_f - oldest if oldest is not None else None
                             for coin in HL_COINS:
                                 tr = self.hl_makers.get((coin, addr.lower()))
                                 if tr:
                                     tr.pnl_known = True
                                     tr.maker_fills = max(tr.maker_fills, n_maker)
                                     tr.est_pnl = pnl
+                                    tr.userfills_oldest_t = oldest
+                                    tr.userfills_oldest_age_s = age
                 except Exception as e:
                     self._note_err("hl_fills", e)
             time.sleep(0.35)
@@ -834,8 +870,7 @@ class Observer:
             for tr in list(self.lighter_makers.values()) + list(self.hl_makers.values()):
                 row = tr.summary()
                 self.store.upsert_maker_stats(row)
-                last_seen = float(tr.last_seen or 0)
-                if now - last_seen > MAKER_HIST_STALE_S:
+                if not should_write_maker_hist(tr, now, MAKER_HIST_STALE_S):
                     continue
                 hist = dict(row)
                 hist["t"] = now

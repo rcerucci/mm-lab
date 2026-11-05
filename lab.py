@@ -136,7 +136,7 @@ class Lab:
                                     continue
                                 tid = tr.get("tid")
                                 if tid is None:
-                                    tid = tr.get("hash")
+                                    tid = (tr.get("hash"), px, sz, tr.get("time"))
                                 if not self.sim.note_tid(tid):
                                     continue
                                 self.sim.on_trade(coin, px, sz, side, _exch_time(tr, now))

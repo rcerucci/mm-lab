@@ -123,6 +123,8 @@ class ArmBook:
     n_cap_overshoot: int = 0
     max_cap_overshoot: float = 0.0
     n_mid_before_fallback: int = 0
+    n_quotes_placed: Dict[str, int] = field(default_factory=lambda: {c: 0 for c in HL_COINS})
+    n_quotes_beyond: Dict[str, int] = field(default_factory=lambda: {c: 0 for c in HL_COINS})
     n_buys: int = 0
     n_sells: int = 0
     volume_usd: float = 0.0
@@ -416,6 +418,10 @@ class Simulator:
                             rec[r] = int(v)
                 if isinstance(braw.get("intentionally_flat"), dict):
                     b.intentionally_flat = {c: bool(v) for c, v in braw["intentionally_flat"].items()}
+                if isinstance(braw.get("n_quotes_placed"), dict):
+                    b.n_quotes_placed = {c: int(braw["n_quotes_placed"].get(c, 0)) for c in HL_COINS}
+                if isinstance(braw.get("n_quotes_beyond"), dict):
+                    b.n_quotes_beyond = {c: int(braw["n_quotes_beyond"].get(c, 0)) for c in HL_COINS}
                 if isinstance(braw.get("as_coin_sum"), dict):
                     for c, hv in braw["as_coin_sum"].items():
                         if isinstance(hv, dict):
@@ -467,6 +473,8 @@ class Simulator:
                         "ref_mid": None,
                         "bid_sz_tt": qraw.get("bid_sz", 0),
                         "ask_sz_tt": qraw.get("ask_sz", 0),
+                        "beyond_visible_bid": False,
+                        "beyond_visible_ask": False,
                     }
                     defaults.update(qraw)
                     return Quote(**{k: defaults[k] for k in Quote.__dataclass_fields__})
@@ -549,6 +557,8 @@ class Simulator:
                 "n_cap_overshoot": b.n_cap_overshoot,
                 "max_cap_overshoot": b.max_cap_overshoot,
                 "n_mid_before_fallback": b.n_mid_before_fallback,
+                "n_quotes_placed": b.n_quotes_placed,
+                "n_quotes_beyond": b.n_quotes_beyond,
                 "n_buys": b.n_buys, "n_sells": b.n_sells, "volume_usd": b.volume_usd,
                 "as_1s_sum": b.as_1s_sum, "as_1s_ntl": b.as_1s_ntl,
                 "as_5s_sum": b.as_5s_sum, "as_5s_ntl": b.as_5s_ntl,
@@ -762,6 +772,11 @@ class Simulator:
 
         bid_sz = (bid_usd / mid) if bid_usd > 0 else 0.0
         ask_sz = (ask_usd / mid) if ask_usd > 0 else 0.0
+        live = next((q for q in (book.quotes.get(coin) or []) if q.retire_at is None), None)
+        # only post_fill may keep the live quote: a timer/jump/pause must still replace
+        if reason == "post_fill" and live is not None and (bid_sz > 0 or ask_sz > 0):
+            if abs(live.bid_sz - bid_sz) <= 1e-12 and abs(live.ask_sz - ask_sz) <= 1e-12:
+                return
         if bid_sz <= 0 and ask_sz <= 0:
             had_live = any(q.retire_at is None for q in (book.quotes.get(coin) or []))
             if had_live:
@@ -798,6 +813,9 @@ class Simulator:
             beyond_visible_ask=_beyond_visible(vis_asks, ask_px, "ask") if ask_sz else False,
         )
         book.quotes.setdefault(coin, []).append(nxt)
+        book.n_quotes_placed[coin] = book.n_quotes_placed.get(coin, 0) + 1
+        if nxt.beyond_visible_bid or nxt.beyond_visible_ask:
+            book.n_quotes_beyond[coin] = book.n_quotes_beyond.get(coin, 0) + 1
         book.last_refresh[coin] = now
 
     def maybe_refresh(self, now: float, force: bool = False) -> None:
@@ -827,7 +845,7 @@ class Simulator:
                                 book.n_pauses[coin] = book.n_pauses.get(coin, 0) + 1
                                 self._retire_quote(book, coin, now)
                 until = book.paused_until.get(coin, 0.0)
-                if until and now >= until and q is None:
+                if until and last < until <= now and q is None:
                     reasons.append("pause_resume")
                 sides = self._allowed_sides(book, coin)
                 prev = book.allowed_sides.get(coin)
@@ -879,7 +897,7 @@ class Simulator:
                 q.bid_queue_ahead = 0.0
                 fill_sz = self._clamp_reduce(book, coin, "buy", q.bid_sz)
                 if fill_sz > 0:
-                    self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=True)
+                    self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=True, beyond_visible=q.beyond_visible_bid)
                     q.bid_sz -= fill_sz
                     if q.bid_sz <= 1e-12:
                         q.bid_sz = 0.0
@@ -892,7 +910,7 @@ class Simulator:
                 if remain > 0 and q.bid_queue_ahead <= 1e-15:
                     fill_sz = self._clamp_reduce(book, coin, "buy", min(q.bid_sz, remain))
                     if fill_sz > 0:
-                        self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=False)
+                        self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=False, beyond_visible=q.beyond_visible_bid)
                         q.bid_sz -= fill_sz
                         if q.bid_sz <= 1e-12:
                             q.bid_sz = 0.0
@@ -906,7 +924,7 @@ class Simulator:
                 q.ask_queue_ahead = 0.0
                 fill_sz = self._clamp_reduce(book, coin, "sell", q.ask_sz)
                 if fill_sz > 0:
-                    self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=True)
+                    self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=True, beyond_visible=q.beyond_visible_ask)
                     q.ask_sz -= fill_sz
                     if q.ask_sz <= 1e-12:
                         q.ask_sz = 0.0
@@ -919,7 +937,7 @@ class Simulator:
                 if remain > 0 and q.ask_queue_ahead <= 1e-15:
                     fill_sz = self._clamp_reduce(book, coin, "sell", min(q.ask_sz, remain))
                     if fill_sz > 0:
-                        self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=False)
+                        self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=False, beyond_visible=q.beyond_visible_ask)
                         q.ask_sz -= fill_sz
                         if q.ask_sz <= 1e-12:
                             q.ask_sz = 0.0
@@ -976,9 +994,11 @@ class Simulator:
             return None
         if next_ts is not None and last_ts is not None and (next_ts - last_ts) > MID_GAP_S:
             return None
+        if next_ts is None and last_ts is not None and (t - last_ts) > MID_GAP_S:
+            return None
         return last
 
-    def _apply_fill(self, book, coin, our_side, px, sz, now, queue: bool = True, through: bool = False) -> None:
+    def _apply_fill(self, book, coin, our_side, px, sz, now, queue: bool = True, through: bool = False, beyond_visible: bool = False) -> None:
         gross_before = book.inv_usd_gross(self.mids) if self.mids else 0.0
         ntl = px * sz
         fee = ntl * HL_MAKER_FEE
@@ -1057,7 +1077,8 @@ class Simulator:
             "spread": book.spread, "refresh_s": book.refresh_s, "coin": coin,
             "side": our_side, "px": px, "sz": sz, "notional": ntl, "fee": fee,
             "mid": mid, "inv_after": book.inv[coin], "latency_s": LATENCY_API_S,
-            "queue_aware": queue, "through": through, "cap": book.cap(self.mids),
+            "queue_aware": queue, "through": through,
+            "beyond_visible": beyond_visible, "cap": book.cap(self.mids),
             "equity": book.equity(self.mids),
             "git_rev": read_git_rev(),
         }))
