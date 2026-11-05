@@ -410,11 +410,11 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
 
     # --- arms table (dense) ---
     arms = Table(box=box.SIMPLE_HEAD, expand=True, pad_edge=False, show_edge=False)
-    arms.add_column("Arm", style="bold", no_wrap=True, min_width=7)
+    arms.add_column("Arm", style="bold", no_wrap=True, min_width=8)
     arms.add_column("Mode", no_wrap=True)
     arms.add_column("Spr", justify="right")
     arms.add_column("Equity", justify="right")
-    arms.add_column("Ret%", justify="right")
+    arms.add_column("Ret%", justify="right", no_wrap=True, min_width=6)
     arms.add_column("Cap", justify="right")
     arms.add_column("Inv%", justify="right")
     arms.add_column("F/O/T", justify="right", no_wrap=True, min_width=9)
@@ -447,10 +447,8 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
         if ret is None:
             ret_t = Text("—", style="dim")
         else:
-            st = "bold green on dark_green" if is_best else ("green" if ret >= 0 else "red")
+            st = "bold green" if is_best else ("green" if ret >= 0 else "red")
             ret_t = Text(f"{ret:+.2f}", style=st)
-            if is_best:
-                ret_t.append("★", style="bold yellow")
         invp = b.get("inv_cap_pct")
         inv_s = f"{invp:.0f}" if invp is not None else "—"
         nxt = b.get("next_recal_s")
@@ -473,8 +471,9 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
         fund_s = f"${fund:+.3f}" if fund is not None else "—"
         spark = _spark(pnl_hist.get(key, []), 12)
         name_style = "dim" if b.get("neighbor") else ("bold yellow" if is_best else "bold")
+        arm_label = f"{key}★" if is_best else key
         arms.add_row(
-            Text(key, style=name_style),
+            Text(arm_label, style=name_style),
             Text(mode, style=mode_style),
             f"{b.get('spread', 0) * 1e4:.0f}b",
             f"${b.get('equity', 0):.2f}",
