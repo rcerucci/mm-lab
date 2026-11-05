@@ -84,6 +84,19 @@ O paper da tarde (pós `40e5fe7`) não conta como corrida oficial. Histórico j�
 - `git_rev` entra em `sim_state.json` e em cada linha de fill; o arquivo `VERSION` acompanha o deploy.
 - 09/11 ~11:00 America/Sao_Paulo segue sendo porte de encanamento + diagnóstico A5/A10/A20, não escolha de ritmo A/B/C/D nem de FIX vs CMP.
 
+## Correções de 05/11 (noite, 2ª) — restart limpo
+O paper iniciado às 19:32 America/Sao_Paulo (git_rev `418d7f7`) também não conta: os itens abaixo mudam o regime de cotação. O estado foi zerado de novo.
+
+- Gatilho de salto compara o mid atual com `ref_mid` (o mid da colocação), não com o `qmid` enviesado pelo skew.
+- Recolocar no teto de 98% só quando o conjunto de lados permitidos muda (borda), não a cada update de book.
+- Pausa é por (braço, moeda), com cooldown `max(5 s, refresh_s)` contado a partir do início.
+- Fill que reduz o bruto é sempre permitido (`projetado <= bruto atual`). Tamanho de redução = `min(ordem, posição)`; residual abaixo de US$ 10 ainda pode zerar. Estouro do teto (janela de 0,28 s) é preenchido e registrado (`n_cap_overshoot`, `max_cap_overshoot`).
+- Handoff é uma lista de cotações com intervalos `[effective_at, retire_at)` — um segundo replace não apaga a cotação do meio.
+- Dois limites de fill: fila (piso, PnL do paper) e trade-through estrito `px < bid` / `px > ask` (teto, só diagnóstico: `n_fills_tt` e AS correspondente).
+- AS usa o `time` da HL; `mid_at_fill` é o último book estritamente anterior ao trade; horizontes de 1 s e 5 s interpolam em `t+h`. Cobertura = amostras válidas / vistas por horizonte (`as_seen` / `as_discard`).
+- Recal: um voto por `(venue, maker_id)`; `promissor_hist` ordena por `t`.
+- `n_replaces` por moeda; a 30 s o esperado é ~120/h.
+
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  
 - Sigma→HL: REST ~280 ms, WS ~470 ms. Viable: ciclo ≥3 s e 10–100 bps.

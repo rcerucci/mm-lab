@@ -181,7 +181,8 @@ class Store:
                           pause_frac,est_pnl,maker_fills,viable,promissor,pnl_known,
                           poll_gap_s
                    FROM maker_hist
-                   WHERE promissor=1 AND t >= ?""",
+                   WHERE promissor=1 AND t >= ?
+                   ORDER BY t""",
                 (since,),
             )
             cols = [d[0] for d in cur.description]

@@ -28,6 +28,22 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+def _exch_time(msg, fallback: float) -> float:
+    """HL book and trade `time` are epoch milliseconds; fall back to local now."""
+    if not isinstance(msg, dict):
+        return fallback
+    raw = msg.get("time")
+    if raw is None:
+        return fallback
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return fallback
+    if val > 1e12:
+        val /= 1000.0
+    return val if val > 0 else fallback
+
+
 class Lab:
     def __init__(self) -> None:
         DATA.mkdir(parents=True, exist_ok=True)
@@ -93,7 +109,7 @@ class Lab:
                                 asks = [(float(x["px"]), float(x["sz"])) for x in levels[1]]
                             except Exception:
                                 continue
-                            self.sim.on_book(coin, bids, asks, now)
+                            self.sim.on_book(coin, bids, asks, _exch_time(data, now))
                         elif ch == "activeAssetCtx" and isinstance(data, dict):
                             coin = data.get("coin")
                             ctx = data.get("ctx") or {}
@@ -111,7 +127,7 @@ class Lab:
                                     px = float(tr["px"]); sz = float(tr["sz"]); side = tr["side"]
                                 except Exception:
                                     continue
-                                self.sim.on_trade(coin, px, sz, side, now)
+                                self.sim.on_trade(coin, px, sz, side, _exch_time(tr, now))
                         if now - last_save > 10:
                             self.sim.save()
                             self._write_dash()
