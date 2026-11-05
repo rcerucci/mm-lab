@@ -416,7 +416,7 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     arms.add_column("Eq", justify="right", no_wrap=True, min_width=7)
     arms.add_column("Ret%", justify="right", no_wrap=True, min_width=6)
     arms.add_column("Cap", justify="right", no_wrap=True, min_width=4)
-    arms.add_column("Inv%", justify="right", no_wrap=True, min_width=3)
+    arms.add_column("Inv%", justify="right", no_wrap=True, min_width=5)
     arms.add_column("F/O/T", justify="right", no_wrap=True, min_width=11)
     arms.add_column("Além", justify="right", no_wrap=True, min_width=7)
     arms.add_column("Paus", justify="right", no_wrap=True, min_width=3)
@@ -450,7 +450,12 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
             st = "bold green" if is_best else ("green" if ret >= 0 else "red")
             ret_t = Text(f"{ret:+.2f}", style=st)
         invp = b.get("inv_cap_pct")
-        inv_s = f"{invp:.0f}" if invp is not None else "—"
+        if invp is None:
+            inv_s = "—"
+        elif 0 < invp < 1:
+            inv_s = f"{invp:.2f}"
+        else:
+            inv_s = f"{invp:.0f}"
         nxt = b.get("next_recal_s")
         if nxt is None:
             recal = "fix" if (b.get("recal_key") == "A" or b.get("neighbor")) else "—"
