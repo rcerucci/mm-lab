@@ -131,6 +131,14 @@ Pacote aplicado sobre `f2c1ed6` / `81dad6f`. Se a revisão não apontar mais nad
 - Limitação documentada, inalterada: `MAX_TRACKED_HL=40` pares `(coin, addr)` vs até 40 endereços no poll (a evicção descarta `n_snaps`/`first_seen` do par frio); piso de 10 bps aplicado depois do `vol_scale`; campos mortos `bid_sz_tt` / `pending_as_tt` / `force` (os `tt` ficam por compatibilidade de load); sem histerese no 98%; `near_bps` é mediana de até 3 pontas (não o toque); `hl_addr_score` acumula sem decaimento.
 - Painel (sem restart do paper): coluna `F/O` virou `F/O/T` (`n_fills` / `n_fills_opt` / `n_fills_through`); colunas `Além` (`sum n_quotes_beyond` / `sum n_quotes_placed`) e `Paus` (`sum n_pauses`); extras com totais through/além/paus. `userfills_oldest_age_s` **não** aparece — vive só no `MakerTracker` em memória e não está em `sim_state` / `maker_stats` (exigiria mudança no observer/lab + restart).
 
+## Correções de 05/11 (noite, lote HL)
+
+- Lote = 10^-szDecimals, conferido em 05/11 no `POST https://api.hyperliquid.xyz/info {"type":"meta"}` público: BTC szDecimals=5 (0,00001), HYPE szDecimals=2 (0,01). Mapa explícito `HL_SZ_DECIMALS` em `config.py`.
+- Cotação: tamanho piso no lote; lado de abertura cujo `sz*px` fique abaixo de HL_MIN_ORDER_USD (US$10) após o piso não é colocado. Lado redutor continua isento do mínimo nocional, mas também vai no lote.
+- Fill (paper e otimista): cada fill é piso no lote; fill menor que 1 lote não credita nada. Fill parcial fica alinhado ao lote. A posição após fill é arredondada ao lote (limpa resíduo de float).
+- Load do sim_state: `inv` de cada moeda é piso no lote; abaixo de 1 lote vira 0 (avg_entry 0) e o ajuste vai ao log. Sem wipe de maker_hist, fills.jsonl, pnl_hist ou sqlite.
+- Consequência: o paper não inventa mais inventário abaixo do lote ("pozinho") que a conta real não poderia ter.
+
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  
 - Sigma→HL: REST ~280 ms, WS ~470 ms. Viable: ciclo ≥3 s e 10–100 bps.

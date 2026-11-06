@@ -1,5 +1,6 @@
 """Perp MM paper simulator: $100 1x account, FIX/CMP caps, queue, funding, recal."""
 from __future__ import annotations
+import math
 
 import json
 import shutil
@@ -22,6 +23,7 @@ from config import (
     HL_MAKER_FEE,
     HL_MAKER_FEE_2X,
     HL_MIN_ORDER_USD,
+    HL_SZ_DECIMALS,
     INITIAL_EQUITY,
     INV_CAP_SOFT,
     LATENCY_API_S,
@@ -60,6 +62,27 @@ def read_git_rev() -> str:
         pass
     return "unknown"
 
+
+
+def lot_size(coin: str) -> float:
+    return 10.0 ** (-HL_SZ_DECIMALS.get(coin, 8))
+
+
+def lot_floor(coin: str, sz: float) -> float:
+    """Floor |sz| to the HL lot toward zero (sign kept). Sub-lot -> 0."""
+    if not sz:
+        return 0.0
+    d = HL_SZ_DECIMALS.get(coin, 8)
+    n = math.floor(abs(sz) * (10 ** d) + 1e-6)
+    v = round(n / (10 ** d), d)
+    return v if sz > 0 else -v
+
+
+def lot_round(coin: str, sz: float) -> float:
+    """Snap a position to the nearest lot (cleans float residue of lot sums)."""
+    d = HL_SZ_DECIMALS.get(coin, 8)
+    v = round(sz, d)
+    return 0.0 if abs(v) < 10.0 ** (-d) / 2 else v
 
 @dataclass
 class Quote:
@@ -393,8 +416,17 @@ class Simulator:
                 ):
                     if attr in braw:
                         setattr(b, attr, braw[attr])
-                b.inv = braw.get("inv", b.inv)
-                b.avg_entry = braw.get("avg_entry", b.avg_entry)
+                b.inv = dict(braw.get("inv", b.inv))
+                for c in list(b.inv):
+                    raw_q = float(b.inv[c] or 0.0)
+                    snapped = lot_floor(c, raw_q) if c in HL_SZ_DECIMALS else raw_q
+                    if abs(snapped - raw_q) > 1e-15:
+                        _log(f"lot snap on load: {key} {c} inv {raw_q!r} -> {snapped!r}")
+                    b.inv[c] = snapped
+                b.avg_entry = dict(braw.get("avg_entry", b.avg_entry))
+                for c, qv in b.inv.items():
+                    if qv == 0.0:
+                        b.avg_entry[c] = 0.0
                 b.last_refresh = braw.get("last_refresh", {})
                 b.last_recal_at = braw.get("last_recal_at", self.started_at)
                 if "paused_until" in braw and isinstance(braw["paused_until"], dict):
@@ -770,8 +802,13 @@ class Simulator:
             bid_px = mid * (1.0 - book.spread)
             ask_px = mid * (1.0 + book.spread)
 
-        bid_sz = (bid_usd / mid) if bid_usd > 0 else 0.0
-        ask_sz = (ask_usd / mid) if ask_usd > 0 else 0.0
+        bid_sz = lot_floor(coin, bid_usd / mid) if bid_usd > 0 else 0.0
+        ask_sz = lot_floor(coin, ask_usd / mid) if ask_usd > 0 else 0.0
+        # after the lot floor, an opening side must still clear the HL min notional
+        if bid_sz > 0 and not reducing_bid and bid_sz * bid_px < HL_MIN_ORDER_USD:
+            bid_sz = 0.0
+        if ask_sz > 0 and not reducing_ask and ask_sz * ask_px < HL_MIN_ORDER_USD:
+            ask_sz = 0.0
         live = next((q for q in (book.quotes.get(coin) or []) if q.retire_at is None), None)
         # only post_fill may keep the live quote: a timer/jump/pause must still replace
         if reason == "post_fill" and live is not None and (bid_sz > 0 or ask_sz > 0):
@@ -880,12 +917,12 @@ class Simulator:
     def _try_fill_one(self, book, coin, px, sz, side, now, q) -> None:
         # optimistic (no queue); kept as a count, not PnL
         if side == "A" and q.bid_sz_opt > 0 and px <= q.bid_px + 1e-12:
-            take = min(q.bid_sz_opt, sz)
+            take = lot_floor(coin, min(q.bid_sz_opt, sz))
             q.bid_sz_opt -= take
             if take > 0:
                 book.n_fills_opt += 1
         if side == "B" and q.ask_sz_opt > 0 and px >= q.ask_px - 1e-12:
-            take = min(q.ask_sz_opt, sz)
+            take = lot_floor(coin, min(q.ask_sz_opt, sz))
             q.ask_sz_opt -= take
             if take > 0:
                 book.n_fills_opt += 1
@@ -895,10 +932,10 @@ class Simulator:
             at_or_through = px <= q.bid_px + 1e-9
             if through:
                 q.bid_queue_ahead = 0.0
-                fill_sz = self._clamp_reduce(book, coin, "buy", q.bid_sz)
+                fill_sz = lot_floor(coin, self._clamp_reduce(book, coin, "buy", q.bid_sz))
                 if fill_sz > 0:
                     self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=True, beyond_visible=q.beyond_visible_bid)
-                    q.bid_sz -= fill_sz
+                    q.bid_sz = lot_round(coin, q.bid_sz - fill_sz)
                     if q.bid_sz <= 1e-12:
                         q.bid_sz = 0.0
             elif at_or_through:
@@ -908,10 +945,10 @@ class Simulator:
                     q.bid_queue_ahead -= eat
                     remain -= eat
                 if remain > 0 and q.bid_queue_ahead <= 1e-15:
-                    fill_sz = self._clamp_reduce(book, coin, "buy", min(q.bid_sz, remain))
+                    fill_sz = lot_floor(coin, self._clamp_reduce(book, coin, "buy", min(q.bid_sz, remain)))
                     if fill_sz > 0:
                         self._apply_fill(book, coin, "buy", q.bid_px, fill_sz, now, through=False, beyond_visible=q.beyond_visible_bid)
-                        q.bid_sz -= fill_sz
+                        q.bid_sz = lot_round(coin, q.bid_sz - fill_sz)
                         if q.bid_sz <= 1e-12:
                             q.bid_sz = 0.0
             elif px > q.bid_px:
@@ -922,10 +959,10 @@ class Simulator:
             at_or_through = px >= q.ask_px - 1e-9
             if through:
                 q.ask_queue_ahead = 0.0
-                fill_sz = self._clamp_reduce(book, coin, "sell", q.ask_sz)
+                fill_sz = lot_floor(coin, self._clamp_reduce(book, coin, "sell", q.ask_sz))
                 if fill_sz > 0:
                     self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=True, beyond_visible=q.beyond_visible_ask)
-                    q.ask_sz -= fill_sz
+                    q.ask_sz = lot_round(coin, q.ask_sz - fill_sz)
                     if q.ask_sz <= 1e-12:
                         q.ask_sz = 0.0
             elif at_or_through:
@@ -935,10 +972,10 @@ class Simulator:
                     q.ask_queue_ahead -= eat
                     remain -= eat
                 if remain > 0 and q.ask_queue_ahead <= 1e-15:
-                    fill_sz = self._clamp_reduce(book, coin, "sell", min(q.ask_sz, remain))
+                    fill_sz = lot_floor(coin, self._clamp_reduce(book, coin, "sell", min(q.ask_sz, remain)))
                     if fill_sz > 0:
                         self._apply_fill(book, coin, "sell", q.ask_px, fill_sz, now, through=False, beyond_visible=q.beyond_visible_ask)
-                        q.ask_sz -= fill_sz
+                        q.ask_sz = lot_round(coin, q.ask_sz - fill_sz)
                         if q.ask_sz <= 1e-12:
                             q.ask_sz = 0.0
             elif px < q.ask_px:
@@ -1043,6 +1080,9 @@ class Simulator:
             else:
                 avg = (avg * old + px * (new - old)) / new
             book.n_sells += 1
+        new = lot_round(coin, new)
+        if new == 0.0:
+            avg = 0.0
         book.inv[coin] = new
         book.avg_entry[coin] = avg
         book.fees_paid += fee

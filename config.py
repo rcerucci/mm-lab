@@ -13,6 +13,9 @@ HL_MAKER_FEE = 0.00015
 HL_MAKER_FEE_2X = 0.00030
 HL_FUNDING_PERIOD_S = 3600.0
 HL_MIN_ORDER_USD = 10.0  # Hyperliquid minimum notional
+# Lot = 10**-szDecimals. Verified 05/11/2026 via public POST https://api.hyperliquid.xyz/info
+# {"type":"meta"}: BTC szDecimals=5 (0.00001), HYPE szDecimals=2 (0.01).
+HL_SZ_DECIMALS = {"BTC": 5, "HYPE": 2}
 
 # Lighter
 LIGHTER_REST = "https://mainnet.zklighter.elliot.ai"

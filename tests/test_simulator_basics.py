@@ -490,3 +490,58 @@ def test_rvol_uses_1s_locf_grid():
     expected = realized_vol_from_returns([0.001] * 30)
     assert snap["rvol_1m"] == pytest.approx(expected)
     assert len(feat.mids) == 31
+
+
+# --- HL lot honesty (szDecimals: BTC 5, HYPE 2) ---
+
+def test_lot_floor_below_one_lot_is_zero():
+    assert S.lot_floor("BTC", 0.0000099) == 0.0
+    assert S.lot_floor("HYPE", 0.0099) == 0.0
+    assert S.lot_floor("BTC", 4e-7) == 0.0
+
+
+def test_lot_floor_1_7_lots_is_one_lot():
+    assert S.lot_floor("BTC", 1.7e-5) == pytest.approx(1e-5)
+    assert S.lot_floor("HYPE", 0.017) == pytest.approx(0.01)
+    assert S.lot_floor("HYPE", -0.017) == pytest.approx(-0.01)
+
+
+def test_fill_cannot_credit_sub_lot(sim):
+    b = _book(sim)
+    q = Quote(bid_px=9.9, ask_px=10.1, bid_sz=0.003, ask_sz=0.0, placed_at=0.0,
+              effective_at=0.0, bid_queue_ahead=0.0, ask_queue_ahead=0.0,
+              bid_sz_opt=0.003, ask_sz_opt=0.0)  # 0.3 HYPE lots
+    b.quotes["HYPE"] = [q]
+    sim._try_fill(b, "HYPE", 9.8, 5.0, "A", now=1.0)
+    assert b.inv["HYPE"] == 0.0 and b.n_fills == 0
+    # partial fill of a lot-aligned quote stays lot-aligned
+    q2 = Quote(bid_px=9.9, ask_px=10.1, bid_sz=1.5, ask_sz=0.0, placed_at=0.0,
+               effective_at=0.0, bid_queue_ahead=0.0, ask_queue_ahead=0.0,
+               bid_sz_opt=1.5, ask_sz_opt=0.0)
+    b.quotes["HYPE"] = [q2]
+    sim._try_fill_one(b, "HYPE", 9.9, 0.737, "A", 1.0, q2)
+    assert b.inv["HYPE"] == pytest.approx(0.73)
+    assert q2.bid_sz == pytest.approx(0.77)
+
+
+def test_placed_quote_sizes_are_lot_aligned(sim):
+    b = _book(sim)
+    sim.mids = {"BTC": 70000.0, "HYPE": 37.123}
+    sim.bbo = {"BTC": (69999.0, 70001.0), "HYPE": (37.12, 37.13)}
+    sim._place(b, "HYPE", now=1.0)
+    q = [x for x in b.quotes["HYPE"] if x.retire_at is None][-1]
+    for v in (q.bid_sz, q.ask_sz):
+        assert abs(v * 100 - round(v * 100)) < 1e-9
+        assert v == 0 or v * 37.123 >= S.HL_MIN_ORDER_USD * 0.99
+
+
+def test_load_snaps_btc_dust_to_zero(sim, tmp_path):
+    b = _book(sim)
+    b.inv["BTC"] = 4e-7
+    b.avg_entry["BTC"] = 100.0
+    b.inv["HYPE"] = 1.23
+    sim.save()
+    sm2 = Simulator(S.Store(tmp_path / "obs2.sqlite"))
+    b2 = sm2.books["A_FIX"]
+    assert b2.inv["BTC"] == 0.0 and b2.avg_entry["BTC"] == 0.0
+    assert b2.inv["HYPE"] == pytest.approx(1.23)
