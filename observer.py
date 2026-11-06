@@ -340,7 +340,7 @@ class MarketFeatures:
         cutoff = t - 60.0
         rvol = None
         spike = False
-        samples = [(tt, m) for tt, m in self.mids if tt <= t]
+        samples = [(tt, m) for tt, m in list(self.mids) if tt <= t]
         if samples:
             last = None
             si = 0
@@ -366,7 +366,7 @@ class MarketFeatures:
                     rvol = realized_vol_from_returns(rets)
                     if abs(rets[-1]) > 0.001:
                         spike = True
-        vol_1m = sum(n for tt, n in self.trades_ntl if tt >= cutoff)
+        vol_1m = sum(n for tt, n in list(self.trades_ntl) if tt >= cutoff)
         imb = self.imbalance
         if self.bid_levels and self.ask_levels:
             imb = _imbalance(self.bid_levels, self.ask_levels, BOOK_DEPTH_FOR_IMB)
@@ -898,6 +898,47 @@ class Observer:
                 await asyncio.wait_for(self._stop.wait(), timeout=3600)
             except asyncio.TimeoutError:
                 self.store.prune(time.time() - ROLLING_WINDOW_S - 86400)
+
+    def live_market_rows(self, now: float) -> List[Dict[str, Any]]:
+        """In-memory market rows in the shape the painel already consumes."""
+        out: List[Dict[str, Any]] = []
+        for (venue, coin), feat in list(self.feat.items()):
+            snap = feat.snapshot(now)
+            if snap.get("mid") is None:
+                continue
+            out.append({
+                "venue": venue, "coin": coin,
+                "mid": snap["mid"], "imb": snap.get("imbalance"),
+                "rvol": snap.get("rvol_1m"), "vol": snap.get("volume_1m"),
+                "funding": snap.get("funding"), "t": snap.get("t", now),
+            })
+        return out
+
+    def live_maker_rows(self, limit: int = 40) -> List[Dict[str, Any]]:
+        """In-memory maker rows in the shape the painel already consumes."""
+        out: List[Dict[str, Any]] = []
+        for tr in list(self.lighter_makers.values()) + list(self.hl_makers.values()):
+            s = tr.summary()
+            out.append({
+                "venue": s["venue"], "maker_id": s["maker_id"], "coin": s["coin"],
+                "cycle": s.get("median_cycle_s"),
+                "near": s.get("median_near_bps"),
+                "size": s.get("median_size_usd"),
+                "pause": s.get("pause_frac"),
+                "pnl": s.get("est_pnl"),
+                "fills": s.get("maker_fills"),
+                "viable": bool(s.get("viable")),
+                "snaps": s.get("n_snaps"),
+                "layers": s.get("median_layers"),
+                "promissor": bool(s.get("promissor")),
+                "pnl_known": bool(s.get("pnl_known")),
+            })
+        out.sort(key=lambda m: (
+            0 if m.get("promissor") else 1,
+            0 if m.get("viable") else 1,
+            -(m.get("snaps") or 0),
+        ))
+        return out[:limit]
 
     def status_dict(self) -> Dict[str, Any]:
         viable = []

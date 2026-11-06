@@ -94,6 +94,7 @@ PID_PATH = DATA / "lab.pid"
 LOG_PATH = DATA / "lab.log"
 FILLS_PATH = DATA / "fills.jsonl"
 DASH_PATH = DATA / "dashboard.json"
+LIVE_SOCK_PATH = DATA / "lab.sock"
 PNL_HIST_PATH = DATA / "pnl_hist.jsonl"
 ROTATE_BYTES = 40 * 1024 * 1024
 KEEP_ROTATED = 3

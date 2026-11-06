@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import websockets
 
-from config import DATA, DASH_PATH, HEARTBEAT_PATH, HL_COINS, HL_WS, LOG_PATH, PID_PATH
+from config import DATA, DASH_PATH, HEARTBEAT_PATH, HL_COINS, HL_WS, LIVE_SOCK_PATH, LOG_PATH, PID_PATH
 from observer import Observer
 from simulator import Simulator
 from storage import Store, _rotate
@@ -155,6 +155,63 @@ class Lab:
                     pass
                 backoff = min(60.0, backoff * 2)
 
+    def build_live_payload(self) -> dict:
+        """In-memory snapshot for the painel (no disk write)."""
+        now = time.time()
+        state = self.sim.state_dict()
+        return {
+            "source": "live",
+            "t": now,
+            "pid": os.getpid(),
+            "started_at": state.get("started_at"),
+            "saved_at": now,
+            "git_rev": state.get("git_rev"),
+            "books": state.get("books") or {},
+            "mids": dict(state.get("mids") or {}),
+            "observer": self.obs.status_dict(),
+            "market": self.obs.live_market_rows(now),
+            "makers": self.obs.live_maker_rows(),
+        }
+
+    async def _live_status_server(self) -> None:
+        if LIVE_SOCK_PATH.exists():
+            try:
+                LIVE_SOCK_PATH.unlink()
+            except OSError:
+                pass
+
+        async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            try:
+                payload = self.build_live_payload()
+                writer.write(json.dumps(payload, default=str).encode())
+                await writer.drain()
+            except Exception as e:
+                log(f"live socket write failed: {e}")
+            finally:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+
+        server = await asyncio.start_unix_server(_handle, path=str(LIVE_SOCK_PATH))
+        try:
+            os.chmod(LIVE_SOCK_PATH, 0o600)
+        except OSError:
+            pass
+        log(f"live status socket {LIVE_SOCK_PATH}")
+        try:
+            async with server:
+                await self._stop.wait()
+        finally:
+            server.close()
+            await server.wait_closed()
+            try:
+                if LIVE_SOCK_PATH.exists():
+                    LIVE_SOCK_PATH.unlink()
+            except OSError:
+                pass
+
     def _write_dash(self) -> None:
         """Compact snapshot for the TUI (avoids heavy reads)."""
         try:
@@ -205,6 +262,7 @@ class Lab:
             asyncio.create_task(self.obs.run(), name="observer"),
             asyncio.create_task(self._hl_feed_for_sim(), name="sim_feed"),
             asyncio.create_task(self._status_heartbeat(), name="hb"),
+            asyncio.create_task(self._live_status_server(), name="live_sock"),
         ]
         try:
             await self._stop.wait()

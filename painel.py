@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sqlite3
 import time
 from collections import defaultdict, deque
@@ -30,7 +31,9 @@ PID = DATA / "lab.pid"
 SUP_PID = DATA / "supervisor.pid"
 DB = DATA / "observer.sqlite"
 DASH = DATA / "dashboard.json"
+LIVE_SOCK = DATA / "lab.sock"
 PNL_HIST = DATA / "pnl_hist.jsonl"
+LIVE_TIMEOUT_S = 0.15
 
 REFRESH_S = 1.0
 VIABLE_MIN_DIST_BPS = 10.0
@@ -223,6 +226,31 @@ def _load_makers(limit: int = 40) -> List[Dict[str, Any]]:
         return []
 
 
+def _load_live(sock_path: Path = LIVE_SOCK, timeout: float = LIVE_TIMEOUT_S) -> Optional[Dict[str, Any]]:
+    """Read one in-memory snapshot from the lab unix socket. None = fall back to files."""
+    if not sock_path.exists():
+        return None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.settimeout(timeout)
+            sock.connect(str(sock_path))
+            chunks = []
+            while True:
+                buf = sock.recv(65536)
+                if not buf:
+                    break
+                chunks.append(buf)
+        finally:
+            sock.close()
+        if not chunks:
+            return None
+        data = json.loads(b"".join(chunks).decode())
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
 def _load_market() -> List[Dict[str, Any]]:
     if not DB.exists():
         return []
@@ -300,18 +328,27 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
         except Exception:
             pass
 
+    live = _load_live()
     state: Dict[str, Any] = {}
-    if STATE.exists():
-        try:
-            state = json.loads(STATE.read_text())
-        except Exception:
-            state = {}
     dash: Dict[str, Any] = {}
-    if DASH.exists():
-        try:
-            dash = json.loads(DASH.read_text())
-        except Exception:
-            pass
+    if live:
+        state = {
+            "started_at": live.get("started_at"),
+            "saved_at": live.get("t") or live.get("saved_at"),
+            "books": live.get("books") or {},
+        }
+        dash = {"observer": live.get("observer") or {}, "source": "live"}
+    else:
+        if STATE.exists():
+            try:
+                state = json.loads(STATE.read_text())
+            except Exception:
+                state = {}
+        if DASH.exists():
+            try:
+                dash = json.loads(DASH.read_text())
+            except Exception:
+                pass
 
     rss = _rss_mb(lab_pid)
     cpu = _cpu_pct(lab_pid, cpu_cache)
@@ -337,6 +374,10 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     health.append("LAB ", style="bold")
     health.append("UP " if lab_ok else "DOWN ", style="bold green" if lab_ok else "bold red")
     health.append(lab_msg + "  ", style="dim")
+    if live:
+        health.append("src=live  ", style="bold green")
+    else:
+        health.append("src=files  ", style="dim")
     health.append(f"sup={'ok' if sup_ok else 'off'}  ", style="dim")
     health.append(f"up={uptime_h:.2f}h  ")
     if rss is not None:
@@ -376,7 +417,7 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     else:
         extras.append("além=—  ", style="dim")
     extras.append(f"paus={pauses_tot}  ", style="dim")
-    makers_all = _load_makers()
+    makers_all = live.get("makers") if live and isinstance(live.get("makers"), list) else _load_makers()
     viable_list = [m for m in makers_all if _is_viable(m)]
     prom_list = [m for m in makers_all if m.get("promissor")]
     v_lig = sum(1 for m in viable_list if m["venue"] == "lighter")
@@ -579,8 +620,9 @@ def build_view(cpu_cache: Dict[str, Any]) -> Layout:
     mkt.add_column("Vol1m$", justify="right")
     mkt.add_column("Fund", justify="right")
     # prefer HL then Lighter, BTC then HYPE
+    market_rows = live.get("market") if live and isinstance(live.get("market"), list) else _load_market()
     order_m = sorted(
-        _load_market(),
+        market_rows,
         key=lambda r: (0 if r["venue"] == "hl" else 1, 0 if r["coin"] == "BTC" else 1),
     )
     for r in order_m:

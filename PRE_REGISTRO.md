@@ -139,6 +139,14 @@ Pacote aplicado sobre `f2c1ed6` / `81dad6f`. Se a revisão não apontar mais nad
 - Load do sim_state: `inv` de cada moeda é piso no lote; abaixo de 1 lote vira 0 (avg_entry 0) e o ajuste vai ao log. Sem wipe de maker_hist, fills.jsonl, pnl_hist ou sqlite.
 - Consequência: o paper não inventa mais inventário abaixo do lote ("pozinho") que a conta real não poderia ter.
 
+## Canal ao vivo do painel (05/11, noite)
+
+- O painel redesenha a cada 1 s, mas Mercado vinha do sqlite (`MARKET_SNAP_S` = 5 s), os braços do `sim_state.json` (save a cada 10 s) e os makers do upsert de 30 s. O laboratório já tinha o mid ao vivo no `l2Book`.
+- Canal novo: socket Unix `data/lab.sock` (mode 0600, só local). A cada conexão o lab responde com um JSON da memória (`source=live`): `books` (mesmo `state_dict` do save), `market` (`feat.snapshot` agora), `makers` (`tracker.summary` agora) e `observer`. Sem gravar esse snapshot.
+- O painel tenta o socket (timeout 150 ms) e cai nos arquivos/sqlite se o lab estiver fora, o socket ausente ou a leitura falhar. A faixa Health mostra `src=live` ou `src=files`.
+- A gravação periódica (5 s / 10 s / 30 s) permanece só para histórico. Sem mudança em lote, fill, quoting, irmã, LOCF ou janelas de recálculo.
+- `snapshot` e `trades_ntl` são copiados com `list(...)` antes de iterar, para não repetir o risco de deque mutada.
+
 ## Observer / latência
 - Lighter poll ~1,5 s + `order_index`; HL hot ~12 s.  
 - Sigma→HL: REST ~280 ms, WS ~470 ms. Viable: ciclo ≥3 s e 10–100 bps.

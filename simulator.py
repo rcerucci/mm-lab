@@ -550,7 +550,7 @@ class Simulator:
             _log(f"sim state backup FAILED: {type(e).__name__}: {e}")
             return None
 
-    def save(self) -> None:
+    def state_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "started_at": self.started_at,
             "saved_at": time.time(),
@@ -625,6 +625,10 @@ class Simulator:
                 "order_usd": b.order_usd(self.mids) if self.mids else ORDER_USD_BASE,
                 "next_recal_s": self._next_recal_s(b),
             }
+        return payload
+
+    def save(self) -> None:
+        payload = self.state_dict()
         tmp = SIM_STATE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, indent=2))
         tmp.replace(SIM_STATE_PATH)
